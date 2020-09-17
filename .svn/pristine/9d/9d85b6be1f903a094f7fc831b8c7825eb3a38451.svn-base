@@ -1,0 +1,41 @@
+package com.wdcloud.graphx.pojo
+
+case class BehaviorType (
+    RETAIN_DAYS: Int = 30, 
+    ACCOUNT: String,
+    USERID: String, 
+    
+    //01
+    CREATE: Double = 0.09, 
+    //02
+    SHARE: Double = 0.05,
+    //03
+    COLLECT: Double = 0.05, 
+    //04
+    UNCOLLECT: Double = 0.05,
+    //05
+    LIKE: Double = 0.05, 
+    //06
+    UNLIKE: Double = 0.05,
+    //07
+    COMMENT: Double = 0.05, 
+    //08
+    REPLY: Double = 0.05,
+    //09
+    FOLLOW: Double = 0.07, 
+    //10
+    UNFOLLOW: Double = 0.07,
+    //11
+    VIEW: Double = 0.07, 
+    //12
+    JOIN: Double = 0.07,
+    //13
+    OUT: Double = 0.07, 
+    //14
+    ADDFriend: Double = 0.07,
+    //15
+    DELETEFriend: Double = 0.07, 
+    //16
+    RATE: Double = 0.07
+)
+

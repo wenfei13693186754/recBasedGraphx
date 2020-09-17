@@ -1,0 +1,60 @@
+package com.wdcloud.graphx.modelTraining
+
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.GraphOps
+
+import com.typesafe.config.Config
+import com.wdcloud.graphx.javaUtil.Configuration
+import com.wdcloud.graphx.javaUtil.Configuration.Resource
+import com.wdcloud.graphx.job.Job
+import com.wdcloud.graphx.modelBuild.graph.GraphModel
+import com.wdcloud.graphx.modelBuild.graph.create.CreateGraphModelFromEdgeByHbase
+import com.wdcloud.graphx.resultHandle.graph.SaveResult
+import com.wdcloud.graphx.resultHandle.graph.SaveResultToHbase
+import com.wdcloud.graphx.scalaUtil.CreateSparkContext
+
+import akka.event.slf4j.Logger
+import org.apache.spark.graphx.impl.GraphImpl
+import org.apache.spark.graphx.impl.VertexPartition
+
+object RRT_Engine {
+  val logger = Logger(this.getClass.getName)
+  def main(args: Array[String]): Unit = {
+    val sc = CreateSparkContext.init()
+
+    //读取用户配置信息，生成配置对象Configuration  
+    val conf = new Configuration()
+    val path = "users_hbase.properties"
+    val resource = new Resource(path)
+    conf.addResource(resource)
+    
+    val job = new Job(sc)
+    job.run(conf)
+
+  }
+
+  def jobserverJob(sc: SparkContext, config: Config) {
+    logger.warn("jobserver调用开始")
+    val conf = new Configuration()
+    conf.set("user.behavior.table", config.getString("user_behavior_table"))
+    conf.set("user.conf.table", config.getString("user_conf_table"))
+    conf.set("user.scene.id", config.getString("user_scene_id"))
+    conf.set("user.business.id", config.getString("user_business_id"))
+    conf.set("rec.recommender.class", config.getString("rec_recommender_class"))
+    conf.set("namespace", config.getString("namespace"))
+    conf.set("rec.result.table", config.getString("rec_result_table"))
+    conf.set("rec.saveReslut.type", config.getString("rec_saveReslut_type"))
+    conf.set("dataSource.type", config.getString("dataSource_type"))
+    val job = new Job(sc)
+    job.run(conf)
+  }
+}
+
+
+
+
+
+
+
+
+

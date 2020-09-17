@@ -1,0 +1,354 @@
+package com.wdcloud.graphx.scalaUtil
+
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.HTable
+import org.apache.hadoop.hbase.client.Put
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.VertexId
+import akka.event.slf4j.Logger
+import org.apache.spark.graphx.Edge
+import collection.JavaConverters._
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import spark.client.SparkSpringRest
+import java.io.IOException
+import java.io.FileNotFoundException
+import scala.io.BufferedSource
+import scala.io.Source
+import com.alibaba.fastjson.JSONArray
+import com.wdcloud.graphx.javaUtil.Configuration
+import java.util.Properties
+import scala.collection.mutable.Map
+/**
+ * spark-submit --name "SparkHbase" --master spark://192.168.6.83:7077 --class com.chen.spark.hbase.SparkHbase lib/SparkHbase.jar
+ */
+object HbaseUtil extends Serializable {
+
+  val logger = Logger(this.getClass.getName)
+
+  //val conf = new SparkConf().setAppName("SparkHbase").setMaster("local")
+  //val sc = new SparkContext(conf)
+  val conf1 = HBaseConfiguration.create()
+  conf1.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+  conf1.set("hbase.zookeeper.property.clientPort", "2181");
+  conf1.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+  conf1.set(TableInputFormat.SCAN_BATCHSIZE, "100") //指定每次扫描返回的数据量
+  conf1.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+  /**
+   * main
+   */
+  def main(args: Array[String]): Unit = {
+    //read("JANUARY:T_USER_BEHAVIOR", sc)
+    //readTableStru(sc)
+    val path = "E:\\推荐系统\\测试\\edges测试.txt"
+    val namespace = "JANUARY"
+    val tableName = "USER_BEHAVIOR"
+    writeSourceDataToHbase(path, namespace, tableName)
+  }
+
+  /**
+   * read
+   * 每次只读取100条用户数据
+   */
+  def read(tableName: String, sc: SparkContext): Unit = {
+    conf1.set(TableInputFormat.INPUT_TABLE, tableName)
+    val admin = new HBaseAdmin(conf1)
+    if (admin.isTableAvailable(tableName)) {
+      val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+        classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+        classOf[org.apache.hadoop.hbase.client.Result])
+      val t1 = System.currentTimeMillis()
+      logger.warn("HBaseUtil RDD complete")
+      //统计数量
+      val count = hBaseRDD.count()
+      logger.warn("HbaseUtil HBase RDD Count:" + count)
+    }
+    conf1.set(TableInputFormat.INPUT_TABLE, tableName)
+    // Initialize hBase table if necessary,初始化hbase表
+    if (admin.isTableAvailable(tableName)) {
+
+      val userRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+        classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+        classOf[org.apache.hadoop.hbase.client.Result])
+      val t1 = System.currentTimeMillis()
+      logger.warn("HbaseUtil RDD complete")
+      //统计数量
+      val count = userRDD.count()
+      logger.warn("HbaseUtil HBase RDD Count:" + count)
+      var countNum = sc.accumulator(0)
+      var list = List[String]()
+      userRDD.foreach {
+        case (_, result) =>
+          val cellArray = result.raw()
+          val ca = cellArray.map { x => (Bytes.toString(x.getKey), Bytes.toString(x.getValue)) }
+          countNum.+=(1)
+          val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes))
+          list = list.+:(USERID)
+          if (list.size >= 30) {
+            val rest = new SparkSpringRest()
+            val p = new Properties()
+            p.put("list", list.asJava)
+            rest.invokSparkBySpringRestWithoutResult(p)
+            list = List[String]()
+          }
+      }
+      if (!list.isEmpty) {
+        val rest = new SparkSpringRest()
+        val p = new Properties()
+        p.put("list", list.asJava)
+        rest.invokSparkBySpringRestWithoutResult(p)
+        list = List[String]()
+      }
+    }
+    admin.close()
+  }
+
+  /**
+   * 读取hbase表结构
+   * 包括某个表的列族和列名
+   * 执行结果：
+   * 	family是：INFO 列是：01  列值是0.09
+   * family是：INFO 列是：02  列值是0.07
+   * family是：INFO 列是：03  列值是0.07
+   * family是：INFO 列是：04  列值是0.07
+   * family是：INFO 列是：05  列值是0.07
+   * family是：INFO 列是：06  列值是0.07
+   * family是：INFO 列是：07  列值是0.07
+   * family是：INFO 列是：08  列值是0.07
+   * family是：INFO 列是：09  列值是0.07
+   * family是：INFO 列是：10  列值是0.05
+   * family是：INFO 列是：11  列值是0.05
+   * family是：INFO 列是：12  列值是0.05
+   * family是：INFO 列是：13  列值是0.05
+   * family是：INFO 列是：14  列值是0.05
+   * family是：INFO 列是：15  列值是0.05
+   * family是：INFO 列是：16  列值是0.05
+   * family是：INFO 列是：ACCOUNT  列值是JANUARY
+   * family是：INFO 列是：RETAIN_DAYS  列值是30
+   * family是：INFO 列是：USER_ID  列值是RRT
+   */
+  def readTableStru(sc: SparkContext): Unit = {
+    val tableName = "JANUARY:T_USER_CONF"
+    val rowKey = "JANUARYRRT"
+    conf1.set(TableInputFormat.INPUT_TABLE, tableName)
+    conf1.set(TableInputFormat.SCAN_ROW_START, rowKey)
+    conf1.set(TableInputFormat.SCAN_ROW_STOP, rowKey)
+    // Initialize hBase table if necessary,初始化hbase表
+    val admin = new HBaseAdmin(conf1)
+    if (admin.isTableAvailable(tableName)) {
+
+      val userRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+        classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+        classOf[org.apache.hadoop.hbase.client.Result])
+
+      userRDD.map { x =>
+        val result = x._2
+        val row = result.rawCells()
+        val info = row.map { cell => (Bytes.toString(cell.getFamily), Bytes.toString(cell.getQualifier), Bytes.toString(cell.getValue)) }
+        println(info.mkString(",")) //(INFO,01,0.09),(INFO,02,0.07),(INFO,03,0.07),(INFO,04,0.07),(INFO,05,0.07),(INFO,06,0.07),(INFO,07,0.07),(INFO,08,0.07),(INFO,09,0.07),(INFO,10,0.05),(INFO,11,0.05),(INFO,12,0.05),(INFO,13,0.05),(INFO,14,0.05),(INFO,15,0.05),(INFO,16,0.05),(INFO,ACCOUNT,JANUARY),(INFO,RETAIN_DAYS,30),(INFO,USER_ID,RRT)
+      }.collect()
+    }
+    admin.close()
+  }
+
+  /**
+   * 将用户对物品的评分写入到hbase表中
+   */
+  def writeUserItemScore(namespace: String, tableName: String, score: Array[Edge[Double]]) {
+    val table = new HTable(conf1, Bytes.toBytes(s"${namespace}:${tableName}"));
+    table.setAutoFlush(false, true)
+    table.setWriteBufferSize(100000)
+    score.foreach { x =>
+      val srcId = x.srcId
+      val dstId = x.dstId
+      val score = x.attr
+
+      val put = new Put((s"${srcId}_${dstId}").getBytes()); //为指定行创建一个Put操作
+      put.addColumn("INFO".getBytes(), "USERID".getBytes(), Bytes.toBytes(srcId)); //写入用户要读取多久时间段的数据
+      put.addColumn("INFO".getBytes(), "ITEMID".getBytes(), Bytes.toBytes(dstId)); //写入命名空间
+      put.addColumn("INFO".getBytes(), "SCORE".getBytes(), Bytes.toBytes(score)); //写入用户业务id 
+      table.put(put)
+    }
+    table.flushCommits()
+    table.close();
+    logger.info("用户对物品的评分成功写入hbase")
+  }
+
+  /**
+   * 将基于好友的推荐结果持久化到hbase中
+   */
+  def writeRecInfoBasedUser(namespace: String, tableName: String, recInfo: Array[(VertexId, (String, Map[String, List[(String, Double)]]))]) {
+    val table = new HTable(conf1, Bytes.toBytes(s"${namespace}:${tableName}"));
+    table.setAutoFlush(false, true)
+    table.setWriteBufferSize(100000)
+    recInfo.foreach { x =>
+      val userId = x._2._1
+      val recInfo = x._2._2.mkString
+      val put = new Put((userId).getBytes()); //为指定行创建一个Put操作
+      put.addColumn("INFO".getBytes(), "USERID".getBytes(), Bytes.toBytes(userId)); //写入用户要读取多久时间段的数据
+      put.addColumn("INFO".getBytes(), "RECINFO".getBytes(), Bytes.toBytes(recInfo)); //写入推荐结果
+      table.put(put)
+    }
+    table.flushCommits()
+    table.close();
+    logger.warn("基于好友的推荐结果写入成功")
+  }
+
+  /**
+   * 将基于圈子的推荐结果持久化到hbase中
+   */
+  def writeRecInfoBasedCircle(namespace: String, tableName: String, recInfo: Array[(VertexId, (String, Map[String, List[(String, Double)]]))]) {
+    val table = new HTable(conf1, Bytes.toBytes(s"${namespace}:${tableName}"));
+    table.setAutoFlush(false, true)
+    table.setWriteBufferSize(100000)
+    recInfo.foreach { x =>
+      val userId = x._2._1
+      val recInfo = x._2._2.mkString
+      val put = new Put((userId).getBytes()); //为指定行创建一个Put操作
+      put.addColumn("INFO".getBytes(), "USERID".getBytes(), Bytes.toBytes(userId)); //写入用户要读取多久时间段的数据
+      put.addColumn("INFO".getBytes(), "RECINFO".getBytes(), Bytes.toBytes(recInfo)); //写入命名空间
+      table.put(put)
+    }
+    table.flushCommits()
+    table.close();
+    logger.info("基于圈子的推荐结果成功写入到hbase中")
+  }
+
+  /**
+   * 将测试使用的原始数据写入到hbase表中
+   */
+  def writeSourceDataToHbase(path: String, namespace: String, tableName: String) {
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    //put data to HBase table
+    val table = new HTable(conf, Bytes.toBytes(s"${namespace}:${tableName}"))
+    table.setAutoFlush(true, true)
+    table.setWriteBufferSize(100000)
+
+    //val path = "C:\\Users\\Administrator\\Desktop\\edgesource.txt"
+    var bs: BufferedSource = null
+    try {
+      bs = Source.fromFile(path)
+      val lines = bs.getLines()
+      var num = 0
+      lines.foreach {
+        x => //january	person_1 person_2 person 01 1466539999000 1483954630570  
+          num = num + 1
+          val fields = x.split(" ")
+          //准备插入一条 key 为 fields(1) 的数据
+          val put = new Put((fields(1) + fields(2)).getBytes()); //为指定行创建一个Put操作
+          //为put操作指定 column 和 value （以前的 put.add 方法被弃用了）
+          put.addColumn("INFO".getBytes(), "ACCOUNT".getBytes(), Bytes.toBytes(fields(0))); //应用系统的唯一标识，命名空间
+          put.addColumn("INFO".getBytes(), "USER_ID".getBytes(), Bytes.toBytes(fields(1))); //用户id
+          put.addColumn("INFO".getBytes(), "ITEM_ID".getBytes(), Bytes.toBytes(fields(2))); //物品id
+          put.addColumn("INFO".getBytes(), "CATEGORY".getBytes(), Bytes.toBytes(fields(3))); //物品类型
+          put.addColumn("INFO".getBytes(), "ACTION".getBytes(), Bytes.toBytes(fields(4))); //写入行为类型
+          put.addColumn("INFO".getBytes(), "BHV_DATETIME".getBytes(), Bytes.toBytes(fields(5))); //行为发生的时间
+          put.addColumn("INFO".getBytes(), "CREATETIME".getBytes(), Bytes.toBytes(fields(6))); //创建表的时间
+
+          table.put(put)
+
+      }
+      table.flushCommits()
+      table.close();
+      logger.warn("数据写入hbase成功,共写入数据" + num + "条")
+    } catch {
+      case e: FileNotFoundException =>
+        logger.error("{" + path + "} file not found")
+        Iterator[String]()
+      case e: IOException =>
+        logger.error("Got a IOException")
+        Iterator[String]()
+    } finally {
+      bs.close
+    }
+
+  }
+  
+  /**
+   * 将基于圈子和基于好友的综合的推荐结果持久化到hbase中
+   * 		列族是INFO,列名是所推荐的物品类目，列值是所推荐的物品以及该物品所对应的评分。
+   * @param:
+   * 		namespace: 结果表所在hbase的命名空间
+   * 		tableName: 结果表表名
+   * 		recInfo: Array[(String, String, Map[String, JSONArray])]-->Array[(命名空间，用户业务id, Map[推荐物品类型, List[(推荐物品业务id, Double)]])]
+   * @return： 
+   * 		写入是否成功
+   */
+  def writeAllRecInfo(namespace: String, tableName: String, recInfo: Array[(Int, String, Map[String, JSONArray])]) {
+    val table = new HTable(conf1, Bytes.toBytes(s"${namespace}:${tableName}"));
+    table.setAutoFlush(false, true)
+    table.setWriteBufferSize(100000) 
+    recInfo.map { x =>
+      val userId = x._2+""
+      val recResult = x._3
+      val put = new Put((userId).getBytes()); //为指定行创建一个Put操作，指定行健是用户业务id
+      recResult.map{
+        x => 
+          val column = x._1+""//得到被推荐物品的类目，作为列名
+          val recValue = x._2//得到该用户对应于这个推荐类目下的推荐结果
+          put.addColumn("INFO".getBytes(), column.getBytes(), Bytes.toBytes(recValue.toString()));//将对应于某个物品类目下的推荐结果写入到某一列 
+      }
+      put.addColumn("INFO".getBytes(), "USERID".getBytes(), Bytes.toBytes(userId)); //写入用户要读取多久时间段的数据
+      put.addColumn("INFO".getBytes(), "namespace".getBytes(), Bytes.toBytes(x._1)); //写入命名空间
+      table.put(put)
+    }
+    table.flushCommits()
+    table.close();
+  }   
+  
+  /**
+   * 将用户配置信息写入到用户配置表JANUARY:T_USER_CONF
+   * @param Configuration  封装了用户配置信息的对象  
+   * @param userConfTable  用户配置表(包括了命名空间的表名)
+   */
+  def writeUserConfInfo(conf: Configuration, userConfTable: String) {
+    val table = new HTable(conf1, Bytes.toBytes(userConfTable));
+    table.setAutoFlush(false, true)
+    table.setWriteBufferSize(100000)
+    val put = new Put((conf.get("user.business.id")+"_"+conf.get("user.scene.id")).getBytes()); //为指定行创建一个Put操作，指定行健是用户业务id
+    val confIter = conf.iterator()
+    while(confIter.hasNext()){
+      val conf = confIter.next()
+      val key = conf.getKey
+      val value = conf.getValue
+      put.addColumn("INFO".getBytes(), key.getBytes(), Bytes.toBytes(value)); 
+    }
+    table.put(put)
+    table.flushCommits()
+    table.close();
+  }    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

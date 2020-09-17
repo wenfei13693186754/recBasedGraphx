@@ -1,0 +1,89 @@
+package com.wdcloud.graphx.job
+
+import com.wdcloud.graphx.javaUtil.Configuration
+import com.wdcloud.graphx.environmentContext.DataContext
+import com.wdcloud.graphx.modelBuild.graph.create.CreateGraphModelFromEdgeByHbase
+import com.wdcloud.graphx.modelBuild.graph.GraphModel
+import com.wdcloud.graphx.modelBuild.graph.ReadData
+import com.wdcloud.graphx.javaUtil.DriverClassUtil
+import com.wdcloud.graphx.resultHandle.graph.SaveResultToHbase
+import com.wdcloud.graphx.resultHandle.graph.SaveResult
+import com.wdcloud.graphx.javaUtil.ReflectionUtil
+import com.wdcloud.graphx.modelTraining.Recommender
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Graph
+import org.apache.spark.rdd.RDD
+import com.wdcloud.graphx.scalaUtil.HbaseUtil
+
+/**
+ * 任务的执行调度
+ */
+class Job(val sc: SparkContext) extends DataContext with Serializable{
+  var conf: Configuration = null
+  var userConf: Map[String, String] = null
+  var graph: Graph[Map[String, Object], Double] = null
+  var result: RDD[(String, String, Map[String, List[(String, Double)]])] = null
+  /**
+   * 运行任务
+   */
+  def run(conf: Configuration) {
+    //如果配置信息在hbase中，那么从用户在hbase的配置表中读取相关配置，并生成userConf对象
+    ReadData.conf = conf
+    HbaseUtil.writeUserConfInfo(conf, "JANUARY:T_USER_CONF")
+    userConf = ReadData.readUserConf(sc)
+    
+    greateModel()
+    trainModel()
+    handleResult()
+  }
+
+  /**
+   * 生成图模型
+   */
+  def greateModel() {
+
+    //获取数据源类型，通过数据源类型得到试用那种方式生成图模型
+    val dataSourceType = userConf.get("dataSource.type")
+    var graphObject: GraphModel = null
+    if (dataSourceType != None) {
+      //根据数据源类型，使用反射创建生成图的实例对象
+      graphObject = (ReflectionUtil.newInstance(DriverClassUtil.getClass(dataSourceType.get))).asInstanceOf[GraphModel]
+    } else {
+      //默认使用边数据生成图  
+      graphObject = new CreateGraphModelFromEdgeByHbase()
+    }
+    //调用生成图的方法
+    graph = graphObject.createGraph(sc)
+  }
+
+  /**
+   * 训练模型（使用配置好的算法对模型进行训练）
+   */
+  def trainModel() {
+    //获取算法标识
+    val algoOption = userConf.get("rec.recommender.class").get
+    //生成推荐对象
+    val recommender = ReflectionUtil.newInstance(DriverClassUtil.getClass(algoOption)).asInstanceOf[Recommender]
+    recommender.userConf = userConf
+    result = recommender.predict(graph)
+
+  }
+
+  /**
+   * 对模型训练的结果进行处理
+   */
+  def handleResult() {
+    //获取推荐结果保存算法标示符
+    val saveRecType = userConf.get("rec.saveReslut.type")
+    //将推荐结果进行持久化
+    var save: SaveResult = null
+    if (saveRecType != None) {
+      save = ReflectionUtil.newInstance(DriverClassUtil.getClass(saveRecType.get)).asInstanceOf[SaveResult]
+    } else {
+      //默认结果持久化到hbase中
+      save = new SaveResultToHbase()
+    }
+    save.userConf = userConf
+    save.saveResult(result)
+  }
+}

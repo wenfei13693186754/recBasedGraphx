@@ -1,0 +1,68 @@
+package com.wdcloud.graphx.modelBuild.graph.create
+
+import org.apache.spark.RangePartitioner
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.VertexId
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import org.apache.spark.graphx.GraphOps
+import org.apache.spark.graphx.PartitionStrategy
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.graphx.Edge
+import com.wdcloud.graphx.environmentContext.DataContext
+import com.wdcloud.graphx.javaUtil.Configuration
+import com.wdcloud.graphx.modelBuild.graph.GraphModel
+import scala.collection.mutable.Map
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.modelBuild.graph.ReadDataFromHbase
+import org.apache.spark.rdd.RDD
+import org.apache.spark.graphx.VertexRDD
+
+/**
+ * 通过边数据生成图
+ */
+class CreateGraphModelFromEdgeByHbase extends GraphModel with Serializable {
+
+  val logger = Logger(this.getClass.getName)
+
+  /**
+   * 读取hbase中的关系数据生成图模型
+   * 
+   * @param sc spark程序的入口
+   * @param conf 封装了用户配置信息的对象
+   * @return 图模型
+   */
+  override def createGraph(@transient sc: SparkContext, @transient conf: Configuration): Graph[Map[Int, Any], Double] = {
+
+    //读取用户配置信息
+    val userConf = ReadDataFromHbase.userConf
+
+    val graphData = ReadDataFromHbase.readGraphData(sc, conf).cache()
+    
+    val edges = graphData.map(x => Edge(x._1, x._2, x._3))
+
+    val vt1 = graphData.map(x => (x._1, x._4))
+    val vt2 = graphData.map(x => (x._2, x._5))
+    val vertex = VertexRDD(vt1.union(vt2))
+    //创建中间图，并缓存
+    val graph: Graph[Map[Int, Any], Double] = Graph(vertex, edges).partitionBy(PartitionStrategy.EdgePartition2D, 24).cache()
+    
+    //全图操作，每个顶点收集自己邻居顶点id
+    val neighIds = graph.collectNeighborIds(EdgeDirection.Either)
+
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val fGraph = graph
+      .joinVertices(neighIds)((id, oldCost, extraCost) => oldCost.+(ReadDataFromHbase.pointAttrMap.get("neiborId").get -> extraCost))
+      .groupEdges((e1, e2) => (e1 + e2)) //合并边，调用groupEdges时要先调用partitionBy
+      .cache()
+    
+    //释放资源
+    graphData.unpersist(blocking = false)
+    graph.unpersistVertices(blocking = false)
+    graph.edges.unpersist(blocking = false)
+    logger.warn("读取hbase中边数据生成图成功")
+
+    fGraph
+  }
+}

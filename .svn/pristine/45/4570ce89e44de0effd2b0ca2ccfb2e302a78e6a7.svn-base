@@ -1,0 +1,113 @@
+package com.wdcloud.graphx.recommend
+
+import java.io.PrintStream
+import java.io.FileOutputStream
+import akka.event.slf4j.Logger
+import java.io.File
+import org.apache.spark.SparkContext
+import com.wdcloud.graphx.pojo.Rec01
+import com.wdcloud.graphx.model.graph.ReadData
+import com.wdcloud.graphx.javaUtil.ReflectionUtil
+import com.wdcloud.graphx.javaUtil.DriverClassUtil
+import com.wdcloud.graphx.model.graph.GraphModel
+import com.wdcloud.graphx.scalaUtil.CreateSparkContext
+import com.wdcloud.graphx.pojo.Algo
+
+object RRT_Engine {
+  val logger = Logger(this.getClass.getName)
+  def main(args: Array[String]): Unit = {
+    val sc = CreateSparkContext.init()
+    
+    //读取配置信息
+    val namespace = algoConfInit.namespace
+    val userIden = algoConfInit.algoId
+    val confTable = algoConfInit.confTable
+    val behTable = algoConfInit.behTable
+    val algoOption = algoConfInit().algoOption
+    
+    
+    //读取配置信息表，获取算法相关配置  
+    val rec = ReadData.getUserInfo(sc, namespace, confTable, userIden)  
+    
+    //生成图  
+    val graph = GraphModel.createGraphFromEdges(sc, namespace, behTable, rec)
+    println("开始生成算法对象")
+    val algo = ReflectionUtil.newInstance(DriverClassUtil.getClass(algoOption))
+    
+    //进行推荐
+    val recCode = new RecCode(graph, namespace)
+    val recResult = recCode.recForUsers()  
+    
+    logger.warn("推荐成功OK")      
+    //将结果转化为json格式   
+//    val jsonResult = DataToJson.recResultRDDToJson(recResult).cache()
+//    
+//    logger.warn("结果转化为jsonOK")
+//    val t1 = System.currentTimeMillis()
+//    val fs = new FileOutputStream(
+//    		new File("C:\\Users\\Administrator\\Desktop\\123.txt"));
+//    val p = new PrintStream(fs);
+//    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2}***${x._3.mkString(",")}"))
+//    
+//    //将结果放到kafka中
+//    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)
+    logger.warn("结果放入到kafka中OK")
+    logger.warn("基于子图的推荐结束")
+    logger.warn("成功结束啦")
+  }
+  
+  //定义了一个bean，用来封装用户基本配置信息
+  def algoConfInit(): Algo = {
+    //用户注册使用的id
+    val userRegId = "wenfei852283049"
+    
+    //新建业务id
+    val serviceId = "rrt_"//业务名称  
+    
+    //新建场景id
+    val sceneId = userRegId+serviceId+"socity_rec"
+    
+    //新建算法模板
+    val algoUser = "recBasedUser"
+    val algoCircle = "recBasedCircle"
+    val algoId = "JANUARYRRT"
+    
+    //命名空间
+    val namespace = "JANUARY"
+    
+    //数据表
+    val confTable = "JANUARY:T_USER_CONF"//配置表  
+    val behTable = "T_USER_BEHAVIOR"//行为表
+    
+    //对应算法在配置表中对应的行健,其实也就是算法id
+    val algoUserId = (sceneId+algoUser).toUpperCase()
+    val algoCircleId = (sceneId+algoCircle).toUpperCase()
+    
+    //定义要使用的算法
+    val algoOption = "com.wdcloud.graphx.recommender.graph.MixCommunityRecommender"
+    
+    Algo.apply(userRegId, serviceId, sceneId, algoId, namespace, confTable, behTable, algoUserId, algoCircleId, algoOption)
+  }
+  
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,41 @@
+
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntList;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import com.sun.tools.javac.util.List;
+
+
+/**
+ * fastutil框架的使用
+ * @author Administrator
+ *
+ */
+public class FastUtilTest {
+	public static void main(String[] args) {
+
+		/**
+		 * fastutil的使用，很简单，比如List<Integer>的list，对应到fastutil，就是IntList
+		 */
+		Map<String, Map<String, IntList>> fastutilDateHourExtractMap = new HashMap<String, Map<String, IntList>>();
+		for (Map.Entry<String, Map<String, IntList>> dateHourExtractEntry : fastutilDateHourExtractMap.entrySet()) {
+			String date = dateHourExtractEntry.getKey(); 
+			Map<String, IntList> hourExtractMap = dateHourExtractEntry
+					.getValue();
+			Map<String, IntList> fastutilHourExtractMap = new HashMap<String, IntList>();
+			for (Map.Entry<String, IntList> hourExtractEntry : hourExtractMap
+					.entrySet()) {
+				String hour = hourExtractEntry.getKey();
+				IntList extractList = hourExtractEntry.getValue();
+				IntList fastutilExtractList = new IntArrayList();
+				for (int i = 0; i < extractList.size(); i++) {
+					fastutilExtractList.add(extractList.get(i));
+				}
+				fastutilHourExtractMap.put(hour, fastutilExtractList);
+			}
+			fastutilDateHourExtractMap.put(date, fastutilHourExtractMap);
+		}
+	}
+}

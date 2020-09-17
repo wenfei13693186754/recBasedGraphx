@@ -1,0 +1,430 @@
+package com.wdcloud.graphx.modelBuild.graph
+
+import java.io.Serializable
+
+import scala.collection.mutable.HashMap
+import scala.collection.mutable.Map
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.spark.Accumulable
+import org.apache.spark.HashPartitioner
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions 
+
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.javaUtil.Configuration
+
+import akka.event.slf4j.Logger
+
+/**
+ * 用来进行数据的读取和保存
+ */  
+object ReadData extends Serializable {
+  val logger = Logger(this.getClass.getName)
+  @transient var userConf: Map[String, String] = null
+
+  //维护了顶点业务id和innerId映射关系
+  var pointIdMap: HashMap[Long, String] = null
+
+  //维护了顶点类型和顶点类型的innerId之间的关系    
+  var pointTypeMap: HashMap[Long, String] = null
+
+  //定义顶点属性映射关系
+  val pointAttrMap: Map[String, Int] = Map("type" -> 1, "neiborId" -> 2, "rec" -> 3)
+
+  /**
+   * 从hbase中读取边数据生成边RDD
+   * @param:
+   * 		SparkContext-->spark运行的上下文
+   * @return：
+   * 		RDD[Edge[Double]]-->生成图使用的边数据，边上放着顶点之间的亲密度
+   *
+   */
+  def readEdgesData(@transient sc: SparkContext, @transient conf: Configuration): RDD[Edge[Double]] = {
+
+    val userconf = sc.broadcast(userConf)
+
+    //维护了顶点业务id和innerId映射关系
+    var accPointIdMap: Accumulable[HashMap[Long, String], (Long, String)] = sc.accumulableCollection(HashMap[Long, String]())
+
+    //维护了顶点类型和顶点类型的innerId之间的关系    
+    var accPointTypeMap: Accumulable[HashMap[Long, String], (Long, String)] = sc.accumulableCollection(HashMap[Long, String]())
+
+    //从hbase中读取用户配置信息
+    val edgeTable = userConf.get("user.behavior.table").get
+    val namespace = userConf.get("namespace").get
+    val tableName = s"${namespace}:${edgeTable}"
+    //创建边RDD  
+    val endTime = System.currentTimeMillis() + ""
+    val startTime = System.currentTimeMillis() + ""
+    //val startTime = (System.currentTimeMillis() + confInfo.get("RETAIN_DAYS").getOrElse("0").toInt * 24 * 60 * 60 * 1000) + ""
+
+    val hbaseConf = HBaseConfiguration.create()
+    hbaseConf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    hbaseConf.set("hbase.zookeeper.property.clientPort", "2181");
+    hbaseConf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    hbaseConf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    hbaseConf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+
+    //这里可以设置用户读取数据的时间段
+    if (startTime.equals(endTime)) { //如果用户没有传RETAIN_DAYS,那么默认采集所有数据，所以这里不需要设置时间段
+      hbaseConf.set(TableInputFormat.INPUT_TABLE, tableName)
+    } else {
+      hbaseConf.set(TableInputFormat.INPUT_TABLE, tableName) //扫描那张表
+      //hbaseConf.set(TableInputFormat.SCAN_TIMERANGE_START, startTime)
+      //hbaseConf.set(TableInputFormat.SCAN_TIMERANGE_END, endTime)
+    }
+
+    val hBaseRDD = sc.newAPIHadoopRDD(hbaseConf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+    val edgesData = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val srcId = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val dstId = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户关系的物品(好友、圈子、物品)业务id
+        val last_time = Bytes.toString(result.getValue("INFO".getBytes, "BHV_DATETIME".getBytes)) //读出时间戳
+        var bhv_type = Bytes.toString(result.getValue("INFO".getBytes, "ACTION".getBytes)) //读出行为类型
+        var dst_category = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出dst顶点类别
+        var src_category = Bytes.toString(result.getValue("INFO".getBytes, "USER_CATEGORY".getBytes)) //读出src顶点类别
+        //对异常数据的处理
+        if (srcId == null || srcId == "" || dstId == null || dstId == "" || last_time == null || last_time == "" || bhv_type == null || bhv_type == "") {
+          Edge(0L, 0L, 0.0)
+        }
+        //对顶点类型没有给出的处理
+        if (src_category == null && dst_category != null) { //如果用户没有设置src顶点的类型，设置了dst顶点的类型，那么设置src顶点类型默认值为person
+          src_category = "01"
+        } else if (src_category != null && dst_category == null) { //如果用户设置src顶点的类型，设没有置dst顶点的类型，那么设置dst顶点类型默认值为item
+          dst_category = "03"
+        } else if (src_category == null && dst_category == null) { //如果用户没有设置src顶点和dst顶点类型，那么设置所有顶点默认类型为point
+          src_category = "00"
+          dst_category = "00"
+        } else {
+        }
+        
+        var src_innerId: Long = hashId(src_category, srcId)
+        var dst_innerId: Long = hashId(dst_category, dstId)
+
+        //建立业务id和innerId映射关系
+        accPointIdMap.add(src_innerId -> srcId)
+        accPointIdMap.add(dst_innerId -> dstId)
+        val userTypeLong = hashId(src_category, "type")
+        val itemTypeLong = hashId(dst_category, "type")
+
+        //建立顶点类型和顶点类型的innerId之间的映射关系
+        accPointTypeMap.add(userTypeLong -> src_category)
+        accPointTypeMap.add(itemTypeLong -> dst_category)
+
+        //读取行为类型
+        val relaScore: Double = userconf.value.get(bhv_type).get.toDouble
+        //计算顶点之间亲密度
+        val totalScore: Double = math.log10(relaScore * 1000000 / math.pow(last_time.toLong / 360000000, 1.5) + 1)
+        val score = (Math.round(totalScore * 10000) / 10000).toDouble
+        Edge(src_innerId, dst_innerId, score)
+    }
+
+    pointIdMap = accPointIdMap.value
+    pointTypeMap = accPointTypeMap.value
+    logger.info("从hbase中的" + tableName + "表中读取用户边属性信息完成")
+    edgesData
+  }
+
+  /**
+   * 通过分别读取用户顶点和物品顶点来生成顶点RDD
+   */
+  def readVertexDataByUserAndItemPoint(@transient sc: SparkContext, @transient conf: Configuration): RDD[(Long, Map[String, Object])] = {
+    val userPoint = readPersonAttrData(sc, conf)
+    val itemPoint = readItemAttrData(sc, conf)
+    userPoint.++(itemPoint)
+  }
+
+  /**
+   * 读取用户属性的信息
+   * 	param:
+   * 		  SparkContext  spark运行的上下文
+   *  return：
+   *  		RDD[(Long, Map[String, Object])]   用户顶点组成的RDD,其含义是RDD[用户innerId, Map[用户类型， 用户业务id]]
+   */
+  def readPersonAttrData(@transient sc: SparkContext, @transient conf: Configuration): RDD[(Long, Map[String, Object])] = {
+
+    //读取配置信息
+    val userVertexTable = conf.get("user.property.table")
+    val namespace = conf.get("namespace")
+    val tableName = s"${namespace}:${userVertexTable}"
+
+    val hbaseConf = HBaseConfiguration.create()
+    hbaseConf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    hbaseConf.set("hbase.zookeeper.property.clientPort", "2181");
+    hbaseConf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    hbaseConf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    hbaseConf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    hbaseConf.set(TableInputFormat.INPUT_TABLE, tableName)
+
+    val hBaseRDD = sc.newAPIHadoopRDD(hbaseConf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+
+    logger.warn("用户属性RDD分区数是: " + hBaseRDD.getNumPartitions)
+
+    val pAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val user_id = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        if (user_id == null) {
+          val attr: Map[String, Object] = Map("type" -> "")
+          (0L, attr)
+        } else {
+          //生成srcId
+          val srcId = hashId("person", user_id)
+          //对于圈子作为一个顶点存在的话，使用如下代码
+          //将属性添加到map集合中
+          val attr: Map[String, Object] = Map("type" -> "person")
+          (srcId, attr)
+        }
+    }
+    logger.info("从hbase中的" + tableName + "表中读取用户属性信息完成")  
+    pAttrRDD
+  }
+
+  /**
+   * 读取用户属性的信息
+   * 	param:
+   * 			SparkContext  spark运行的上下文
+   *  return：
+   *  		RDD[(Long, Map[String, Object])]   物品顶点组成的RDD,其含义是RDD[物品innerId, Map[物品类型， 物品业务id]]
+   */
+  def readItemAttrData(@transient sc: SparkContext, @transient conf: Configuration): RDD[(Long, Map[String, Object])] = {
+
+    //读取配置信息
+    val itemVertexTable = conf.get("item.property.table")
+    val namespace = conf.get("namespace")
+    val tableName = s"${namespace}:${itemVertexTable}"
+
+    val hbaseConf = HBaseConfiguration.create()
+    hbaseConf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    hbaseConf.set("hbase.zookeeper.property.clientPort", "2181");
+    hbaseConf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    hbaseConf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    hbaseConf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    hbaseConf.set(TableInputFormat.INPUT_TABLE, tableName)
+    hbaseConf.set(TableInputFormat.SCAN_TIMERANGE_END, tableName)
+    val hBaseRDD = sc.newAPIHadoopRDD(hbaseConf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+
+    logger.warn("物品属性RDD分区数是: " + hBaseRDD.getNumPartitions)
+
+    val iAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用物品业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品类别
+
+        if (ITEM_ID == null || CATEGORY == null) {
+          (1L, Map("type" -> "", "businessId" -> ""))
+        }
+        val srcId = hashId(CATEGORY, ITEM_ID)
+        //将属性添加到map集合中
+        var attr: Map[String, Object] = Map("type" -> CATEGORY)
+        (srcId, attr)
+    }
+    logger.warn("从hbase中的" + tableName + "表中读取物品属性信息完成")
+    iAttrRDD
+  }
+
+  /**
+   * 读取用户顶点和物品顶点信息，也就是用户信息和物品信息在一张表中呢
+   * 	param:
+   * 			SparkContext  spark运行的上下文
+   *  return：
+   *  		RDD[(Long, Map[String, Object])]   用户和物品顶点组成的RDD,其含义是RDD[用户或者物品innerId, Map[用户或物品类型， 用户或物品业务id]]
+   */
+  def readVertexData(@transient sc: SparkContext, @transient conf: Configuration): RDD[(Long, Map[String, Object])] = {
+
+    //维护了顶点业务id和innerId映射关系
+    var accPointIdMap: Accumulable[HashMap[Long, String], (Long, String)] = sc.accumulableCollection(HashMap[Long, String]())
+
+    //维护了顶点类型和顶点类型的innerId之间的关系    
+    var accPointTypeMap: Accumulable[HashMap[Long, String], (Long, String)] = sc.accumulableCollection(HashMap[Long, String]())
+
+    //读取配置信息
+    val vertexTable = conf.get("vertex.property.table")
+    val namespace = conf.get("namespace")
+    val tableName = s"${namespace}:${vertexTable}"
+
+    val hbaseConf = HBaseConfiguration.create()
+    hbaseConf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    hbaseConf.set("hbase.zookeeper.property.clientPort", "2181");
+    hbaseConf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    hbaseConf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    hbaseConf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    hbaseConf.set(TableInputFormat.INPUT_TABLE, tableName)
+
+    val hBaseRDD = sc.newAPIHadoopRDD(hbaseConf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+    val pAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val srcId = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val dstId = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出物品业务id
+        val category = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品业务类别
+        //生成srcId
+        val src_innerId = hashId("person", srcId)
+        val userTypeLong = hashId("person", "type")
+        val pAttr: Map[String, Object] = Map("type" -> Long.box(userTypeLong))
+        //生成物品itemId
+        val dst_innerId = hashId(category, dstId)
+        val itemTypeLong = hashId(category, "type")
+        val iAttr: Map[String, Object] = Map("type" -> Long.box(itemTypeLong))
+
+        //建立顶点类型和顶点类型的innerId之间的映射关系
+        accPointTypeMap.add(userTypeLong -> "01")
+        accPointTypeMap.add(itemTypeLong -> category)
+
+        //建立顶点的业务id和innerId的映射关系
+        accPointIdMap.add(src_innerId -> srcId)
+        accPointIdMap.add(dst_innerId -> dstId)
+
+        ((src_innerId, pAttr), (dst_innerId, iAttr))
+    }
+
+    val pointInfo = pAttrRDD.map(_._1).++(pAttrRDD.map(_._2)).distinct()
+    pAttrRDD.count()
+    pointIdMap = accPointIdMap.value
+    pointTypeMap = accPointTypeMap.value
+
+    logger.warn("读取顶点信息成功")
+    pointInfo
+  }
+
+  /**
+   * 读取用户算法配置信息，配置项没有写死，不同的用户的配置项可能不同，这里是读取指定用户的每个配置项
+   * 	 param:
+   * 			SparkContext: 代码运行上下文
+   *   return：
+   *   		Array[(String, String)]   是一个封装了指定用户配置信息的数组
+   */
+  def readUserConf(@transient sc: SparkContext, @transient conf: Configuration): Map[String, String] = {
+
+    //获取配置信息
+    val namespace = conf.get("namespace")
+    val confTable = conf.get("user.conf.table")
+    val rowKey = conf.get("user.business.id") + "_" + conf.get("user.scene.id")
+    val family = "INFO"
+
+    val hbaseConf = HBaseConfiguration.create()
+    hbaseConf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    hbaseConf.set("hbase.zookeeper.property.clientPort", "2181");
+    hbaseConf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    hbaseConf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    hbaseConf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    hbaseConf.set(TableInputFormat.INPUT_TABLE, "JANUARY:T_USER_CONF")
+    hbaseConf.set(TableInputFormat.SCAN_ROW_START, rowKey)
+    hbaseConf.set(TableInputFormat.SCAN_ROW_STOP, rowKey) //这里的SCAN_ROW_START和SCAN_ROW_STOP设置的值一样，是因为我们只从hbase中读取这一个用户的配置信息，所以只对应一行数据
+    hbaseConf.set(TableInputFormat.SCAN_COLUMN_FAMILY, family)
+
+    val hBaseRDD = sc.newAPIHadoopRDD(hbaseConf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+
+    val confInfo = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      x =>
+        val result = x._2
+        val row = result.rawCells() //返回支持此Result实例的Cells组成的数组
+        row.map { cell => (Bytes.toString(cell.getQualifier), Bytes.toString(cell.getValue)) }
+
+    }.first.toMap
+    
+    val mmuMap: Map[String, String] = Map[String, String]()
+    userConf = mmuMap.++=(confInfo)
+    logger.warn("读取配置信息成功")
+    
+    userConf
+  }
+
+  /**
+   * 从hbase中读取边数据生成顶点属性RDD，用来在只使用边数据创建图的时候，读取必要的顶点属性
+   * param:
+   * 		SparkContext-->spark运行的上下文
+   * return：
+   * 		RDD[(Long, Map[String, Object])]-->生成的顶点属性信息
+   *
+   */
+  def readTypeFromEdgeData(@transient sc: SparkContext): RDD[(Long, Map[Int, Any])] = {
+
+    val broPointTypeMap = sc.broadcast(pointTypeMap)
+
+    //从hbase中读取用户配置信息
+    val namespace = userConf.get("namespace").get
+    val edgeTable = userConf.get("user.behavior.table").get
+    val tableName = s"${namespace}:${edgeTable}"
+
+    //创建边RDD
+    val hbaseConf = HBaseConfiguration.create()
+    hbaseConf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    hbaseConf.set("hbase.zookeeper.property.clientPort", "2181");
+    hbaseConf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    hbaseConf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    hbaseConf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    hbaseConf.set(TableInputFormat.INPUT_TABLE, tableName) //扫描那张表
+
+    val hBaseRDD = sc.newAPIHadoopRDD(hbaseConf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+
+    val pointType = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val srcId = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val dstId = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户关系的物品(好友、圈子、物品)业务id
+        var dst_category = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出dst顶点类别
+        var src_category = Bytes.toString(result.getValue("INFO".getBytes, "USER_CATEGORY".getBytes)) //读出src顶点类别
+
+        //对顶点类型没有给出的处理
+        if (src_category == null && dst_category != null) { //如果用户没有设置src顶点的类型，设置了dst顶点的类型，那么设置src顶点类型默认值为person
+          src_category = "01"
+        } else if (src_category != null && dst_category == null) { //如果用户设置src顶点的类型，设没有置dst顶点的类型，那么设置dst顶点类型默认值为item
+          dst_category = "03"
+        } else if (src_category == null && dst_category == null) { //如果用户没有设置src顶点和dst顶点类型，那么设置所有顶点默认类型为point
+          src_category = "00"
+          dst_category = "00"
+        } else {
+        }
+
+        val userTypeLong = hashId(src_category, "type")
+        val itemTypeLong = hashId(dst_category, "type")
+
+        var pAttr: Map[Int, Any] = Map(1 -> userTypeLong)
+        var iAttr: Map[Int, Any] = Map(1 -> itemTypeLong)
+
+        var src_innerId: Long = hashId(src_category, srcId)
+        var dst_innerId: Long = hashId(dst_category, dstId)
+
+        ((src_innerId, pAttr), (dst_innerId, iAttr)) 
+    }
+
+    val pt = pointType.map(_._1).++(pointType.map(_._2)).distinct()
+    logger.warn("从hbase中的" + tableName + "表中读取顶点类型信息完成")
+    pt
+  } 
+
+  /*
+   * 标识不同物品id的工具方法
+   */
+  def hashId(name: String, str: String) = {
+    Hashing.md5().hashString(name + "" + str).asLong()
+  } 
+
+} 
+
+
+
+
+
+

@@ -1,0 +1,111 @@
+package com.wdcloud.graphx.scalaUtil
+
+import com.alibaba.fastjson.JSONArray
+import com.alibaba.fastjson.JSONObject
+import org.apache.spark.rdd.RDD
+import akka.event.slf4j.Logger
+
+/**
+ * 将推荐结果按照需要转化为对应的json格式
+ */
+object DataToJson extends Serializable {
+
+  val logger = Logger(this.getClass.getName)
+
+  /**
+   * 将推荐结果中的对每个用户的推荐结果组成的MapJSONObject格式
+   * param：
+   * 	RDD[(String, String, Map[String, List[(String, Double)]])]-->RDD[(命名空间，用户业务id, Map[推荐物品类型, List[(推荐物品业务id, Double)]])]
+   * return:
+   * 	RDD[(String, String, JSONObject)]
+   */
+  def recResultRDDMapToJson(result: RDD[(String, String, Map[String, List[(String, Double)]])]): RDD[(String, String, JSONObject)] = {
+
+    val jsonResult = result.map(x => (x._1, x._2, mapToJson(x._3)))
+    jsonResult
+  }
+
+  /**
+   * 将推荐结果中的对每个用户的推荐结果组成的Map中的list转化为json格式
+   * param：
+   * 		RDD[(命名空间，用户业务id, Map[推荐物品类型, List[(推荐物品业务id, Double)]])]
+   * return:
+   * 		RDD[(命名空间，用户业务id, Map[推荐物品类型, List[(推荐物品业务id, Double)]])]
+   */
+  def recResultRDDListToJson(
+    recResult: RDD[(String, String, Map[String, List[(String, Double)]])]): RDD[(String, String, Map[String, JSONArray])] =
+    {
+      val jsonResult = recResult.map(x => (x._1, x._2, listToJson(x._3)))
+      jsonResult
+    }
+
+  /**
+   * 将Map[String, List[(String, Double)]]类型的推荐结果转化为JSONObject类型的数据
+   * 	param:
+   * 		Map[String, List[(String, Double)]]-->某个用户的推荐列表组成的map
+   * return：
+   * 		Map[String, JSONArray]-->某个用户的推荐列表转化为了JSONObject的结果
+   */
+  def mapToJson(data: Map[String, List[(String, Double)]]): JSONObject = {
+    val jsonObject = new JSONObject
+    data.foreach { y => //(String, List[(String, Double)])
+      val jsonItems = new JSONArray
+      y._2.foreach { x => //(String, Double)
+        val jsonItem = new JSONArray
+        jsonItem.add(x._1)
+        jsonItem.add(x._2) //通过两次add后得到的json格式是：["item2",4]
+        jsonItems.add(jsonItem) //遍历完成后得到的数据结构是[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]
+      }
+      jsonObject.put(y._1, jsonItems)
+    }
+    jsonObject
+  }
+
+  /**
+   * 将Map[String, List[(String, Double)]]类型的推荐结果中的list转化为JSONArray类型的数据
+   * 	param:
+   * 		Map[String, List[(String, Double)]]-->某个用户的推荐列表组成的map
+   * return：
+   * 		Map[String, JSONArray]-->某个用户的推荐列表中的list推荐结构转化为了JSONArray的结果
+   */
+  def listToJson(data: Map[String, List[(String, Double)]]): Map[String, JSONArray] = {
+    val listJson = data.map { x =>
+      (x._1, listToJson(x._2))
+    }
+    listJson
+  }
+
+  /**
+   * 将List[(String, Double)]类型的推荐结果转化为JSONArray类型
+   * param:
+   * 		List[(String, Double)]-->List[(物品业务id, score)]
+   * param:
+   * 		JSONArray-->转化为JSONArray格式的推荐结果
+   */
+  def listToJson(data: List[(String, Double)]): JSONArray = {
+    val jsonItems = new JSONArray
+    data.foreach { y => //(String, Double)
+      val jsonItem = new JSONArray
+      jsonItem.add(y._1)
+      jsonItem.add(y._2) //通过两次add后得到的json格式是：["item2",4]
+      jsonItems.add(jsonItem) //遍历完成后得到的数据结构是[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]
+    }
+    jsonItems
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

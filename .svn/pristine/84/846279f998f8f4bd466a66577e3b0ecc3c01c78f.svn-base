@@ -1,0 +1,17 @@
+package com.wdcloud.graphx.graphOperate
+
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+
+object CreateSparkContext extends Serializable{
+  //private val conf = new SparkConf().setAppName("graphDemo").setMaster("spark://192.168.6.83:7077")
+  private val conf = new SparkConf().setAppName("graphDemo").setMaster("local[*]")
+  conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+  @transient private val sc: SparkContext = new SparkContext(conf) 
+  def init (): SparkContext = {
+    sc
+  }
+  def stop (){
+    sc.stop()
+  }
+} 

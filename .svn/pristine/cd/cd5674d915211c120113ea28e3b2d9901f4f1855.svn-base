@@ -1,0 +1,20 @@
+package com.wdcloud.graphx.test
+
+import scala.collection.JavaConverters._
+import scala.io.Source
+import spark.client.SparkSpringRest
+
+
+object SubGraphTest {
+  def main(args: Array[String]): Unit = {
+    Source.fromFile("E:\\spark\\Spark-GraphX\\data\\subGraphTest\\subGraphBatch5Data.txt").getLines().foreach {
+      x =>
+        val row = x.split("@")
+        val list = row.map { x => x.split(",").toList }
+        list.foreach { x =>
+          val rest = new SparkSpringRest();
+          rest.invokSparkBySpringRestWithoutResult(x.asJava);
+        }
+    }
+  }
+}

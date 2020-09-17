@@ -1,0 +1,17 @@
+package com.wdcloud.graphx.unit
+
+import org.apache.kafka.common.utils.Bytes
+
+object test {
+  def main(args: Array[String]): Unit = {
+    val t1 = math.log10(1000000 / math.pow("20161008013218".toLong / 36000000, 1.5) + 1)
+    val t2 = math.log10(10 * 1000000 / math.pow("20161008013218".toLong / 36000000, 1.5) + 1)
+    val t3 = math.log10(20 * 1000000 / math.pow("20161008013218".toLong / 36000000, 1.5) + 1)
+    val t4 = math.log10(50 * 1000000 / math.pow("20161008013218".toLong / 36000000, 1.5) + 1)
+    println(t1)
+    println(t2)
+    println(t3)
+    println(t4)
+    
+  }
+}

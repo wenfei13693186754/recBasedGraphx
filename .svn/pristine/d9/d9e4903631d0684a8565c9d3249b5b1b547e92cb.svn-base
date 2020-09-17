@@ -1,0 +1,232 @@
+package com.wdcloud.graphx.graphOperate
+
+import java.io.Serializable
+
+import scala.Iterator
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.EdgeTriplet
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import org.apache.spark.graphx.TripletFields
+import org.apache.spark.graphx.VertexId
+import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.unit.DataToJson
+import com.wdcloud.graphx.kafka.Producer
+import com.wdcloud.graphx.hbase.SparkHbase
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.HTable
+import org.apache.hadoop.hbase.client.Put
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+
+ import akka.event.slf4j.Logger
+import scala.collection.immutable.Seq
+import org.apache.hadoop.hbase.client.Get
+import org.apache.hadoop.hbase.client.Scan
+
+/**
+ * 读取Hbase中的边和顶点数据，生成边RDD和顶点RDD
+ */
+class ReadData() extends Serializable{
+  val logger = Logger(this.getClass.getName)
+  val conf1 = HBaseConfiguration.create()
+  conf1.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+  conf1.set("hbase.zookeeper.property.clientPort", "2181");
+  conf1.set(TableInputFormat.SCAN_CACHEBLOCKS, "false")//指定扫描出的数据是不是进行缓存，false代表不缓存
+  conf1.set(TableInputFormat.SCAN_BATCHSIZE, "1000")//指定每次扫描返回的数据量
+  conf1.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO")//指定扫描的列族|
+  
+  /**
+   * 根据用户关系表读取关系表中数据生成边RDD
+   * param:
+   * 		edgeTable：Hbase中存放用户物品(包括好友和物品)关系信息的表的表名
+   * return:
+   * 		RDD[Edge[Double]]
+   * 			RDD由Edge[Double]组成，其中Double代表边上的属性，这个属性是边所连接的两个顶点的亲密度值。
+   */
+  def readEdgesData(edgeTable: String): RDD[Edge[Double]] = {  
+    val sc = OperateSparkContext.init()
+    /**
+     * TableInputFormat包含多个可以用来优化HBase的读取的设置值，比如将扫描限制到一部分列，以及扫描的时间范围。
+     * 可以在其官方文档：http://hbase.apache.org/apidocs/org/apache/hadoop/hbase/mapreduce/TableInputFormat.html中找到详细信息，并在HBaseConfiguration中对它们进行设置
+     */
+    conf1.set(TableInputFormat.INPUT_TABLE, edgeTable)//扫描那张表
+    
+    // Initialize hBase table if necessary,初始化hbase表
+    //val admin = new HBaseAdmin(conf1)
+    //if (admin.isTableAvailable(tableName)) {
+    /**
+     * newAPIHadoopRDD是用来读取其它Hadoop输入格式数据的
+     * 它的接收一个路径以及三个类，如果有需要设定额外的Hadoop配置属性，也可以传入一个conf对象
+     * 		它的三个类：
+     * 				1.第一个类是“格式”类，代表输入的格式；
+     * 				2.第二个则是键的类；  
+     * 				3.第三个类是值的类。
+     * (因为我们可以通过Hadoop输入格式访问HBase,这个格式返回的键值对的数据中键和值的类型就是我们下边的类型)
+     */
+    val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+      
+    //创建一个累加器,用来计算读取到的数据行数
+    var count = sc.accumulator(0)
+    val edgesRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        count.+=(1)
+        val key = Bytes.toString(result.getRow)
+        val ACCOUNT = Bytes.toString(result.getValue("INFO".getBytes, "ACCOUNT".getBytes)) //读出命名空间
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户关系的物品(好友、圈子、物品)业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品类别
+        val LAST_TIME = Bytes.toString(result.getValue("INFO".getBytes, "LAST_TIME".getBytes)) //读出时间戳
+        val SHARE = Bytes.toString(result.getValue("INFO".getBytes, "INFO.SHARE".getBytes)) //读出交互：分享次数
+        val COMMENT = Bytes.toString(result.getValue("INFO".getBytes, "INFO.COMMENT".getBytes)) //读出相同属性
+        val REPLY = Bytes.toString(result.getValue("INFO".getBytes, "INFO.REPLY".getBytes)) //读出回复的次数
+        if (ACCOUNT == null || USERID == null || ITEM_ID == null || CATEGORY == null || LAST_TIME == null || SHARE == null || COMMENT == null || REPLY == null) {}
+
+        //生成srcId
+  			val srcId = HashIdUtil.hashId("person", USERID)
+  			//生成dstId
+  			val dstId = HashIdUtil.hashId(CATEGORY, ITEM_ID)
+  			//计算user和一度好友交流的总次数，包括点赞、聊天等
+  			val communicateNum = SHARE.toInt + REPLY.toInt
+  			//计算user和一度好友的最近一次交互的时间与当前时间的差
+				(srcId,dstId,communicateNum,LAST_TIME.toLong)
+    }
+    
+    val t4 = System.currentTimeMillis()
+    //计算出user和一度好友的总的交互次数和总的交互的时间差的和
+    //val userData = edgesRDD.map(x => (x._3,x._4)).reduce( (x,y) => (x._1+y._1,x._2+y._2))
+    //计算出user和一度好友的平均交互次数和平均共有特征数量
+    //val comAvg: Double = userData._1/count.value//平均交互次数
+    val comAvg = 2
+    //val t5 = System.currentTimeMillis()
+    //logger.warn("计算交互次数用时："+(t5 - t4))
+    //调用countCohesion方法计算user和一度好友之间的亲密度
+    val edges = countCohesion(edgesRDD,comAvg)
+    val t6 = System.currentTimeMillis()
+    logger.warn("计算亲密度用时："+(t6 - t4))
+    //创建边  
+    //val edges = finallyCohesion.map(x => Edge(x._1,x._2,x._3))
+    val t7 = System.currentTimeMillis()
+    logger.warn("创建边用时："+(t7 - t6)) 
+    //通过.txt文件计算出图的顶点，顶点的一个属性是该顶点所属的类别，是人还是物
+    edges
+  }
+
+  /**
+   * 根据用户表读取用户表中数据生成边RDD
+   * param:
+   * 		perTable：Hbase中存放用户信息的表的表名
+   * return:
+   * 		RDD[(Long, Map[String, Object])]
+   */
+  def readPersonAttrData(perTable: String): RDD[(Long, Map[String, Object])] = {
+    val sc = OperateSparkContext.init()
+    conf1.set(TableInputFormat.INPUT_TABLE, perTable)
+    // Initialize hBase table if necessary,初始化hbase表
+    //val admin = new HBaseAdmin(conf1)
+    //if (admin.isTableAvailable(tableName)) {
+    val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+      
+    val pAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出用户类别类别
+        //对读出来的数据进行过滤，过滤掉不合格的数据
+        //生成srcId
+        val srcId = HashIdUtil.hashId(CATEGORY, USERID)
+        //对于圈子作为一个顶点存在的话，使用如下代码
+        //将属性添加到map集合中
+        var attr: Map[String, Object] = Map("type" -> CATEGORY,"businessId" -> USERID, "gender" -> "girl", "年龄" -> "25", "住址" -> "beijing", "姓名" -> "rose",
+            "life" -> "3", "other" -> "1234567")
+        (srcId, attr)
+    }
+    pAttrRDD
+  }
+
+  /**
+   * 根据物品表读取物品表中数据生成边RDD
+   * param:
+   * 		itrTable: Hbase中存放物品信息的表的表名
+   * return:
+   * 		RDD[(Long, Map[String, Object])]
+   * 			Long是顶点id
+   * 			顶点的属性是Map结构的，key是String类型的，value是Object类型的
+   */
+  def readItemAttrData(itrTable: String): RDD[(Long, Map[String, Object])] = {
+    val sc = OperateSparkContext.init()
+    conf1.set(TableInputFormat.INPUT_TABLE, itrTable)
+    // Initialize hBase table if necessary,初始化hbase表
+    //val admin = new HBaseAdmin(conf1)
+    //if (admin.isTableAvailable(tableName)) {
+    val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+    val iAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出用户类别类别
+
+        //对读出来的数据进行过滤，过滤掉不合格的数据
+        //将读出来的数据按照规定格式拼接起来，成为一行，
+        val srcId = HashIdUtil.hashId(CATEGORY, ITEM_ID)
+        //对于圈子作为一个顶点存在的话，使用如下代码
+        //将属性添加到map集合中
+        var attr: Map[String, Object] = Map("type" -> CATEGORY,"businessId" -> ITEM_ID, "住址" -> "beijing", "姓名" -> "play",
+            "life" -> "3", "other" -> "1234567")
+        (srcId, attr)
+    }
+    iAttrRDD
+  }
+
+    /*
+   * 计算图上两个节点之间的亲密度
+   * param:
+   * 		edgeData[(Long, Long, Int, Long)]
+   * 				四个参数分别代表：srcId,dstId,两个顶点的交互次数，最近一次交互时间和当前时间的时间差
+   * 		comAvg:用户之间的平均交互次数；
+   * 
+   * return：
+   * 		RDD[(long,long,Double)]
+   * 			三个参数分别代表：srcId,dstId和两个顶点之间的亲密度得分
+   */
+  def countCohesion(edgeData: RDD[(Long, Long, Int, Long)], comAvg: Double): RDD[Edge[Double]] = {
+    //计算亲密度
+    val cohesion = edgeData.map { x =>
+      var scoreCom: Double = 0
+      var totalScore: Double = 0
+      if (comAvg != 0) {
+        scoreCom = (x._3 - comAvg) * 0.6 / comAvg
+        //时间差的指数作为分母
+        totalScore = scoreCom / math.pow(x._4 / 3600000, 1.5)
+      } else {
+        totalScore = -1.0
+      } 
+      Edge(x._1, x._2, totalScore)
+    }
+
+    //cohesion.foreach { x => logger.warn(x._1+" 与 "+x._2+" 相似度是  "+x._3) }
+    cohesion
+  } 
+}
+
+
+
+
+
+
+

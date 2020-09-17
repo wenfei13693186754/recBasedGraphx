@@ -1,0 +1,11 @@
+package com.wdcloud.graphx.environmentContext
+
+import com.wdcloud.graphx.javaUtil.Configuration
+import org.apache.spark.broadcast.Broadcast
+
+/**
+ * 推荐引擎运行的上下文
+ */
+abstract class DataContext(var userConf: Map[String, String]){
+  
+}  

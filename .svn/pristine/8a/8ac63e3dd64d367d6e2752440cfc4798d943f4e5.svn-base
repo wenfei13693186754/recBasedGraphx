@@ -1,0 +1,290 @@
+package com.wdcloud.graphx.graphOperate
+
+import java.io.Serializable
+
+import scala.Iterator
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.EdgeTriplet
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import org.apache.spark.graphx.TripletFields
+import org.apache.spark.graphx.VertexId
+import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.unit.DataToJson
+import com.wdcloud.graphx.kafka.Producer
+import com.wdcloud.graphx.hbase.SparkHbase
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.HTable
+import org.apache.hadoop.hbase.client.Put
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+
+ import akka.event.slf4j.Logger
+import scala.collection.immutable.Seq
+import org.apache.hadoop.hbase.client.Get
+import org.apache.hadoop.hbase.client.Scan
+import org.apache.spark.graphx.Pregel
+import com.wdcloud.graphx.unit.PregelUtil
+
+/**
+ * 推荐核心代码
+ * 	基于圈子的推荐和基于好友的推荐
+ */
+object RecCode extends Serializable{
+   val logger = Logger(this.getClass.getName)       
+  /*
+   * 基于圈子对用户进行全量推荐好友、物品和圈子
+   * 步骤如下：首先所有顶点发送信息给src顶点，也就是user顶点，user顶点收到消息后将该消息以kv形式保存到map属性中；然后第二次迭代user顶点发送它们收到的消息和它们自己的属性给圈子顶点，
+   * 圈子顶点收到消息后以kv形式保存到map属性中；最后第三次迭代圈子顶点将收到的消息发送到user顶点。user顶点收到消息后从消息中去除掉自己直接关系的顶点信息并且对结果进行合并，作为最终的推荐结果。
+   * 其间要将图上的hash后的id值转化为业务id后作为处理结果返回。
+   * 
+   * 迭代过程中使用自定义的PregelUtil的成员变量iterNum来断定迭代次数
+   * 	iterNum初始值是0，没进行一次迭代增加1
+   * 
+ 	 * 返回的结果：RDD[(String, String, Map[String, List[(String, Double)]])]-->RDD[(命名空间名称, 用户的业务id, Map[推荐物品类型, List[(推荐物品业务id, score)]])]
+   */  
+  def recICUForUserBasedCircle(graph: Graph[Map[String, Object], Double]): RDD[(VertexId, (String, Map[String, List[(String, Double)]]))] = {
+    logger.warn("基于圈子的推荐使用的线程是：" + Thread.currentThread().getName)
+    val t0 = System.currentTimeMillis()  
+    //调用自定义的pregel方法
+    val g1 = PregelUtil.apply(graph, List[(VertexId, (String, Double, String))](), 3, EdgeDirection.Either)(
+      (id, oldAttr, newAttr) =>
+        if (newAttr.size == 0) { //初始化
+          
+          oldAttr.+("rec" -> Map[String, List[(VertexId, Double, String)]]())
+        } else if (PregelUtil.iterNum == 3) { //第三次迭代，将圈子上的推荐信息聚合到圈子的直接关系用户上
+          
+          //对聚合到用户顶点的信息进行合并去重，这里是对scala集合的操作，所以不需要担心shuffle
+          val dealData = newAttr.groupBy(x => x._1).map{x =>
+            val data = x._2.reduce((x, y) => (x._1, (x._2._1, x._2._2 + y._2._2, x._2._3)))
+            data._2
+          }.groupBy(x => x._1).map(x => (x._1, (x._2.map(y => (y._3, y._2)).toList)))
+          
+          //将处理后的信息保存到map中
+          oldAttr.updated("rec", dealData) 
+        } else { //第一次和第二次迭代
+          
+          oldAttr.updated("rec", newAttr) 
+        },
+        
+      triplet =>
+        if(PregelUtil.iterNum == 0){//初始化后第一次迭代
+          val dstAttr = triplet.dstAttr
+          Iterator((triplet.srcId, List((triplet.dstId, (dstAttr.apply("type").asInstanceOf[String], triplet.attr, dstAttr.apply("businessId").asInstanceOf[String])))))
+          
+        }else if(PregelUtil.iterNum == 1 && triplet.dstAttr.apply("type").asInstanceOf[String].equals("circle")){//第二次迭代，开始发送消息到圈子顶点了
+          
+          val srcAttr = triplet.srcAttr
+          //获取到圈子的一度用户和用户的下一级直接关系物品的亲密度score，格式是:List[(VertexId, (String, Double))]，乘上圈子和直接用户的score作为圈子二度关系物品的得分
+          //然后重新组成字符串发送到圈子节点上
+          val attr = srcAttr.apply("rec").asInstanceOf[List[(VertexId, (String, Double, String))]].map { x =>
+            val score = x._2._2 * triplet.attr.toDouble
+            (x._1, (x._2._1, score, x._2._3))
+          }
+
+          //因为基于圈子给用户推荐好友，圈子的直接关系用户被推荐给圈子的另一个用户的概率理论会远远大于圈子的二度用户，所以这里将圈子的直接关系用户顶点添加到发送的消息中
+          val userInfo: List[(VertexId, (String, Double, String))] = List((triplet.srcId, (srcAttr.apply("type").asInstanceOf[String], triplet.attr, srcAttr.apply("businessId").asInstanceOf[String])))
+          println(userInfo.mkString(","))
+          //将圈子的直接关系用户顶点信息追加到attr上
+          val newAttr = attr.:::(userInfo)
+          
+          Iterator((triplet.dstId, newAttr))
+          
+        }else if(PregelUtil.iterNum == 2){//第三次迭代，将圈子上的推荐信息聚合到圈子直接相关的人上
+          
+          Iterator((triplet.srcId, triplet.dstAttr.apply("rec").asInstanceOf[List[(VertexId, (String, Double, String))]]))
+        }else{
+          
+          Iterator.empty
+        },
+      (a, b) => a.:::(b)
+    ).cache()
+    
+    val t1 = System.currentTimeMillis()
+    logger.warn("基于圈子的pregel三次迭代操作用时："+(t1-t0))
+    val resultData = g1.vertices.filter(x => x._2.apply("type").asInstanceOf[String].equals("person"))
+      .map { x =>
+        var recData = Map[String, List[(String, Double)]]()
+        if (x._2.apply("rec").isInstanceOf[Map[String, List[(String, Double)]]]) {
+          recData = x._2.apply("rec").asInstanceOf[Map[String, List[(String, Double)]]]
+        } else {
+          recData = Map[String, List[(String, Double)]]()
+        }
+        (x._1, (x._2.apply("businessId").asInstanceOf[String], recData))
+      }.cache()
+    //使用g1结束后，将g1从缓存中移除
+    g1.unpersist(false)
+    resultData.foreach(x => println("基于圈子的推荐-->用户 "+x._1+" 基于圈子的推荐结果是：类型"+x._2._1+" 结果："+x._2._2.mkString(",")))
+    resultData
+  }
+
+  /*
+   * 基于一度好友推荐好友、物、圈子
+   * 使用pregel，迭代两次，第一次dst顶点发送消息给src顶点，第二次dst顶点发送它收到的第一次迭代的消息给src顶点
+   * 迭代次数使用自定义的PregelUtil中的iterNum来判定
+   * 	iterNum初始值是0，每执行一次迭代增加1
+   * vprog:
+   * 		1.初始化：初始化信息是 List[(VertexId, (String, Double, String))]()，vprog函数收到这个信息后，给每个顶点添加rec->Map[String, List[(VertexId, Double, String)]]()属性，用来存放结果
+   * 		2.第一次迭代收到的消息是 List[(VertexId, (type, Double, 业务id))]((...))，将其放在key是rec的位置；
+   * 		3.第二次迭代收到的消息是List[(VertexId, (type, Double, 业务id))]((...))，将其放在key的位置上；
+   * 			这个时候要对数组进行处理：包括对相同VertexId的数据进行分数累加去重和分组，最后的处理结果格式是：Map[String, List[(VertexId, Double, String)]]
+   * 
+   * sendMsg：
+   * 		1.第一次迭代：发送 List[(VertexId, (type, Double, 业务id))]((...))给src顶点
+   * 		2.第二次迭代：限定只有收到第一次迭代消息的顶点才可以发送消息（发送消息的方向设置为IN），发送的消息是第一次迭代收到的消息；
+   * 				第二次发送数据时候，要将第一次迭代收到的消息中的分数乘上当前triplet上的score作为最终的score
+   * 
+   * mergeMsg：
+   * 		1.第一次迭代，收到的消息是List[(VertexId, (type, Double, 业务id))]((...))，将这些消息使用.:::合并为一个List
+   * 		2.第二次迭代，收到的消息是List[(VertexId, (type, Double, 业务id))]((...))，将这些消息使用.:::合并为一个List
+   * 
+   * 返回值类型是：RDD[(String, Map[String, List[(String, Double)]])]
+   */
+  def recBasedSimUser(graph: Graph[Map[String, Object], Double]): RDD[(VertexId, (String, Map[String, List[(String, Double)]]))] = {
+    
+    val t0 = System.currentTimeMillis()
+    //调用自定义的PregelUtil方法执行pregel迭代操作
+    val g2 = PregelUtil.apply(graph, List[(VertexId, (String, Double, String))](), 2, EdgeDirection.In)(
+      (vid, oldAttr, newAttr) =>
+        if (newAttr.size == 0) { //初始化
+         
+          oldAttr.+("rec" -> Map[String, List[(String, Double)]]())
+        } else if (PregelUtil.iterNum == 1) { //第一次迭代,收到的信息格式：List[(VertexId, (String, Double, String))]
+          
+          oldAttr.updated("rec", newAttr)
+        } else if (PregelUtil.iterNum == 2) { //第二次迭代,收到的信息格式：List[(VertexId, (String, Double, String))]-->List[(被推荐物品hash后的id,, (类型, Double, 业务id))]
+          
+          //这个时候要对数组进行处理：包括对相同VertexId的数据进行分数累加去重和分组,最终存储的格式是：Map[type, List[(VertexId, Double, 业务id)]]
+          val dealData = newAttr.groupBy(x => x._1).map{x =>
+            val data = x._2.reduce((x, y) => (x._1, (x._2._1, x._2._2 + y._2._2, x._2._3)))
+            data._2
+          }.groupBy(x => x._1).map(x => (x._1, (x._2.map(y => (y._3, y._2)).toList)))
+          oldAttr.updated("rec", dealData)
+        } else {
+          
+          oldAttr
+        },
+      triplet =>
+        if (PregelUtil.iterNum == 0) { //第一次迭代发送的数据格式：List[(VertexId, (String, Double, String))]-->List[(被推荐物品hash后的id, (类型, Double, 业务id))]
+          val dstAttr = triplet.dstAttr
+          Iterator((triplet.srcId, List[(VertexId, (String, Double, String))]((triplet.dstId, (dstAttr.apply("type").asInstanceOf[String], triplet.attr, dstAttr.apply("businessId").asInstanceOf[String])))))
+        } else { //第二次迭代,限定只有收到第一次迭代消息的顶点才可以发送消息（发送消息的方向设置为IN），发送的消息是第一次迭代收到的消息；
+          val dstAttr = triplet.dstAttr
+          //第二次发送数据时候，要将第一次迭代收到的消息中的分数乘上当前triplet上的score作为最终的score
+          if (dstAttr.apply("rec").isInstanceOf[List[(VertexId, (String, Double, String))]]) {
+            val itera1 = dstAttr.apply("rec").asInstanceOf[List[(VertexId, (String, Double, String))]] //取出每个dst顶点上的map中的“rec”键对应的value，类型是：List[(String,String)],分别代表id和类别:score类型的数组
+            val itera2 = itera1.map(x => (x._1, (x._2._1, x._2._2 * triplet.attr, x._2._3)))
+            Iterator((triplet.srcId, itera2))  
+          } else {
+            Iterator.empty
+          }
+        },
+      (data1, data2) => data1.:::(data2)
+    ).cache()
+    
+    val t1 = System.currentTimeMillis()
+    logger.warn("基于好友的pregel两次迭代用时："+(t1-t0))
+    val resultData = g2.vertices.filter(x => x._2.apply("type").asInstanceOf[String].equals("person"))
+      .map(x =>
+        try {
+          if (x._2.apply("rec").isInstanceOf[Map[String, List[(String, Double)]]]) {
+            (x._1, (x._2.apply("businessId").asInstanceOf[String], x._2.apply("rec").asInstanceOf[Map[String, List[(String, Double)]]]))
+          } else {
+            (x._1, (x._2.apply("businessId").asInstanceOf[String], Map[String, List[(String, Double)]]()))
+          }
+        } catch {
+          case ex: NoSuchElementException => (x._1, ("", Map[String, List[(String, Double)]]()))
+        }
+      ).cache()
+   //使用g1结束后，将g1从缓存中移除
+    g2.unpersist(false)
+    resultData.foreach(x => println("基于好友的推荐-->用户 "+x._1+" 基于好友的推荐结果是：类型"+x._2._1+" 结果："+x._2._2.mkString(",")))
+    resultData
+  }
+
+  /*
+   * 将基于好友的推荐结果和基于圈子的推荐结果进行合并,并将合并好的数据放入到kafka中
+   * 传来的数据格式：List[(String, Map[String, List[(String, Double)]])]-->List[(用户的业务id, Map[推荐物品类型, List[(推荐物品业务id, score)]])]
+   * 返回的结果格式：List[(String, String, Map[String, List[(String, Double)]])]-->List[(命名空间名称, 用户的业务id, Map[推荐物品类型, List[(推荐物品业务id, score)]])]
+   * 
+   * 处理过程：
+   * 1.首先将传来的基于好友的推荐结果和基于圈子的推荐结果合并为一个List
+   * 2.将相同用户id的推荐信息合并为一个map
+   * 		(1).将两个推荐结果map先转化为list，然后合并到一起
+   * 		(2).对list集合按照类型进行分组
+   * 		(3).对分组后内容进行合并和去重
+   * 				这里，经过之前的分组，同一个用户的相同类型的推荐结果分到了一组，并组成一个list,所以这里就需要对同一类型的推荐结果组成的list进行处理
+   *				list2的数据格式是：Map[String, List[(String, List[(String, Double)])]]-->Map[类型, List[(类型, List[(被推荐物品的业务id, score)])]]
+   * 				1.对分组后的由相同类型推荐内容组成的list的数据进行合并，就是将同一种类型的推荐结果(list)合并为一个list
+   * 				2.因为合并后的内容是由多个可能存在重复id的被推荐物品组成的，所以这里需要对相同id的数据进行分数累加，并去重
+   * 3.将命名空间加入到结果中
+   * 4.将结果RDD转化为一个数组
+   */
+  def combineResult(
+      g2: Graph[Map[String, Object], Double],
+      nameSpace: String,
+      recBasedFriends: RDD[(VertexId, (String, Map[String, List[(String, Double)]]))],
+      recBasedCircle: RDD[(VertexId, (String, Map[String, List[(String, Double)]]))]
+    ): RDD[(String, String, Map[String, List[(String, Double)]])] = {
+    //1.先将两个数组合到一起
+    val arr1 = recBasedFriends.++(recBasedCircle)
+
+    //2.将相同用户id的推荐信息(map)合并为一个map,
+    //返回结果是;RDD[(String, Map[String, List[(String, Double)]])]-->RDD[(用户业务id, Map[推荐物品类型, List[(推荐物品业务id, Double)]])]
+    val arr2 = arr1.reduceByKey((x, y) => (x._1, mapCombine(x._2, y._2)))
+    //进行去重,获取每个用户顶点对应的邻居节点id
+    val neiborIdForPerson = g2.aggregateMessages[String](
+      triplet =>
+        triplet.sendToSrc(triplet.dstAttr.apply("businessId").asInstanceOf[String]),
+      (x, y) => x + "|" + y,
+      TripletFields.All).map(x => (x._1, x._2.split("\\|")))
+
+    //将推荐的结果中过滤掉用户顶点的直接关系顶点
+    //返回的结果：RDD[(String, String, Map[String, List[(String, Double)]])]-->RDD[(命名空间名称, 用户的业务id, Map[推荐物品类型, List[(推荐物品业务id, score)]])]
+    val recResult = arr2.join(neiborIdForPerson).map { x =>
+      //x=>(VertexId, ((String, Map[String, List[(String, Double)]]), List[String]))-->(用户hashid， ((用户业务id， Map[类型， List[(被推荐物品业务id, score)]]),用户的邻居节点业务id组成的数组))
+      val filterData = x._2._1._2.map(y => ("INFO."+y._1, y._2.filter(z => !x._2._2.contains(z._1) && !z._1.equals(x._2._1._1)).sortBy(x => x._2).take(10)))
+      //这里讲命名空间传进去
+      (nameSpace, x._2._1._1, filterData)
+    }.cache()
+    recResult
+  }
+
+  /*
+   * 参数代表同一个用户下的基于圈子的推荐信息和基于好友的推荐信息
+   * Map[String, List[(String, Double)]]-->Map[type, List[(被推荐物品业务id, score)]]
+   * 将两个map进行合并，条件是相同的用户id，对list进行合并，并对合并后的list进行分数累加和去重
+   * 返回的是一个新的Map[String, List[(String, Double)]]
+   */
+  def mapCombine(data1: Map[String, List[(String, Double)]], data2: Map[String, List[(String, Double)]]): Map[String, List[(String, Double)]] = {
+    val t1 = System.currentTimeMillis()
+    //1.将两个推荐结果map先转化为list，然后合并到一起
+    val list1 = data1.toList.++(data2.toList) //List[(String, List[(String, Double)])]
+    //2.对list集合按照类型进行分组
+    val list2 = list1.groupBy(x => x._1)
+    //3.对分组后内容进行合并和去重
+    //这里，经过之前的分组，同一个用户的相同类型的推荐结果分到了一组，并组成一个list,所以这里就需要对同一类型的推荐结果组成的list进行处理
+    //list2的数据格式是：Map[String, List[(String, List[(String, Double)])]]-->Map[类型, List[(类型, List[(被推荐物品的业务id, score)])]]
+    val result = list2.map { x => //x:(String, List[(String, List[(String, Double)])])
+      //对分组后的由相同类型推荐内容组成的list的数据进行合并，就是将同一种类型的推荐结果(list)合并为一个list
+      //返回值：List[(String, Double)]，代表当前类型下的推荐结果组成的list
+      val comData = x._2.map(_._2).reduce((x, y) => x.++(y))
+      //因为合并后的内容是由多个可能存在重复id的被推荐物品组成的，所以这里需要对相同id的数据进行分数累加，并去重
+      val addScoreData = comData.groupBy(_._1).map(x => (x._1, x._2.map(_._2).reduce((x, y) => x + y))).toList
+      (x._1, addScoreData)
+    }
+
+    val t2 = System.currentTimeMillis()
+    result
+  }
+
+}

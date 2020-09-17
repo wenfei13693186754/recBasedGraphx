@@ -1,0 +1,185 @@
+package com.wdcloud.graphx.recommend
+
+import java.io.File
+import java.io.FileOutputStream
+import java.io.PrintStream
+import java.io.Serializable
+
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.VertexRDD
+import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
+
+
+import akka.event.slf4j.Logger
+import org.apache.hadoop.fs.Path
+import scala.io.Source
+import com.wdcloud.graphx.test.CreateSparkContext
+import com.wdcloud.graphx.model.graph.GraphModel
+import com.wdcloud.graphx.scalaUtil.CreateSubGraph
+import com.wdcloud.graphx.scalaUtil.UserIdToLong
+import com.wdcloud.graphx.scalaUtil.DataToJson
+import com.wdcloud.graphx.scalaUtil.Producer
+import com.wdcloud.graphx.model.graph.ReadData
+
+/**
+ * 使用spark-graphx实现基于好友、圈子来实现推荐二度好友、圈子、物品
+ * 		要求：1.离线的、全量的；
+ * 				 2.各种关系基于不同权重进行推荐
+ *
+ * jobserver调用
+ *
+ */
+object RecEngBySubGraph extends Serializable {
+
+  val logger = Logger(this.getClass.getName)
+  def main(args: Array[String]): Unit = {
+    val sc = CreateSparkContext.init()
+    val namespace = "JANUARY"
+    val service = "rrt_"
+    val scene = "socity_rec"
+    val userIden = (service+scene).toUpperCase()
+    val tableName = "JANUARY:T_USER_CONF"
+    val rec = ReadData.getUserInfo(sc, namespace, tableName, userIden)
+    
+    val edgeTable = "T_USER_BEHAVIOR"
+    val graph = GraphModel.createGraphFromEdges(sc, namespace, edgeTable, rec)
+
+    val recCode = new RecCode(graph, namespace)
+    val recResult = recCode.recForUsers()
+    logger.warn("推荐成功OK")
+    //将结果转化为json格式
+    val jsonResult = DataToJson.recResultRDDToJson(recResult).cache()
+    logger.warn("结果转化为jsonOK")
+    val t1 = System.currentTimeMillis()
+    val fs = new FileOutputStream(
+    		new File("C:\\Users\\Administrator\\Desktop\\123.txt"));
+    val p = new PrintStream(fs);
+    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2}***${x._3.mkString(",")}"))
+    //将结果放到kafka中
+    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)
+    logger.warn("结果放入到kafka中OK")
+    logger.warn("基于子图的推荐结束")
+    logger.warn("成功结束啦")
+  }
+
+  def startRecEntry(
+    sc: SparkContext,  
+    namespace: String,
+    edgeTable: String,
+    pAttrTable: String,
+    iAttrTable: String,
+    userIdListStr: List[String],
+    vertexPath: String,
+    edgePath: String) {
+    logger.warn("startRecEntry用户业务id是：" + userIdListStr.toString());
+    //将用户的业务id转化为long类型的id
+    val userIdListLong = UserIdToLong.userIdToLong(userIdListStr)
+    logger.warn("将用户的业务id转化为long类型的id")
+    //创建图
+    val t0 = System.currentTimeMillis()
+    val vertices = sc.objectFile[(Long, Map[String, Object])](vertexPath).cache()
+    logger.warn("读取vertex数据OK")
+    val edges = sc.objectFile[Edge[Double]](edgePath).cache()
+    logger.warn("读取edges数据OK")
+    val graph = Graph(vertices, edges).cache
+    logger.warn("创建图OK")
+    val subGraph = CreateSubGraph.createSubGraph(graph, userIdListLong).cache()
+    logger.warn("获取子图OK")
+    logger.warn("全图顶点数：" + graph.vertices.count() + "||子图顶点数：" + subGraph.vertices.count() + "全图边数：" + graph.edges.count() + "子图边数：" + subGraph.edges.count())
+
+    val recCode = new RecCode(subGraph, namespace)
+    val recResult = recCode.recForUsersWithUserList(userIdListStr)
+    logger.warn("推荐成功OK")
+    //将结果转化为json格式
+    val jsonResult = DataToJson.recResultRDDToJson(recResult).cache()
+    logger.warn("结果转化为jsonOK")
+    //将结果放到kafka中
+    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)
+    logger.warn("结果放入到kafka中OK")
+    val t1 = System.currentTimeMillis()
+    logger.warn("基于子图合并推荐结果结束,用时：" + (t1 - t0))
+    //    val fs = new FileOutputStream(
+    //      new File("/wdcloud/app/spark/data/rec_jobserver_result/recResultBySubGraph.log"));
+    //    val p = new PrintStream(fs);
+    //    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2}***${x._3.mkString(",")}"))
+    logger.warn("基于子图的推荐结束")
+    logger.warn("成功结束啦")
+  }
+
+  def buildIncrementGraph(
+    sc: SparkContext,
+    namespace: String,
+    edgeTable: String,
+    pAttrTable: String,
+    iAttrTable: String) {
+    val t0 = System.currentTimeMillis()
+    val oldVertex = sc.objectFile[(Long, Map[String, Object])]("hdfs://192.168.6.84:9000/graph/vertices")
+    val oldEdges = sc.objectFile[Edge[Double]]("hdfs://192.168.6.84:9000/graph/edges")
+    logger.warn("旧图读取成功")
+    
+    val userId = "RRT"
+    val namespace = "JANUARY"
+    val userIden = namespace+userId
+    val tableName = "T_USER_CONF"
+    val rec = ReadData.getUserInfo(sc, namespace, tableName, userIden)
+    //创建边RDD
+    val newEdges = ReadData.readEdgesData(sc, s"${namespace}:${edgeTable}", rec)
+
+    //创建顶点RDD
+    val newVertex = ReadData.readPersonAttrData(sc, s"${namespace}:${pAttrTable}").++(ReadData.readItemAttrData(sc, s"${namespace}:${iAttrTable}"))
+
+    //RDD的合并
+    val vertex = oldVertex.++(newVertex)
+    val edges = oldEdges.++(newEdges)
+    //生成增量图
+    val graph = Graph(vertex, edges)
+    val t1 = System.currentTimeMillis()
+    logger.warn("生成增量图用时：" + (t1 - t0))
+    val num = graph.vertices.count()  
+
+    //准备删除旧的图
+    //This is our HDFS output path
+    val vertexOut = "hdfs://192.168.6.84:9000/graph/vertices" 
+    val edgesOut = "hdfs://192.168.6.84:9000/graph/edges"
+    // Setup HDFS, you can manipulate the config used by your application to override the defaults
+    val hadoopConf = new org.apache.hadoop.conf.Configuration()
+    hadoopConf.setInt( "dfs.block.size", 1073741824 ) // Like a 1G block size
+    val hdfs = org.apache.hadoop.fs.FileSystem.get(new java.net.URI("hdfs://192.168.6.84:9000"), hadoopConf)  
+    // Delete the existing path, ignore any exceptions thrown if the path doesn't exist
+    try { 
+      logger.warn("开始删除旧图1")
+      val a = hdfs.delete(new org.apache.hadoop.fs.Path(vertexOut), true) 
+      val b = hdfs.delete(new org.apache.hadoop.fs.Path(edgesOut), true) 
+      logger.warn("删除旧图成功")
+    } catch { case _ : Throwable => { } }
+    //将新生成的图进行保存
+    graph.vertices.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/vertices")
+    graph.edges.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/edges")
+    logger.warn("保存新图成功")
+  }
+
+  def buildAllDataGraph(
+    sc: SparkContext,
+    namespace1: String,
+    namespace2: String,
+    edgeTable1: String,
+    pAttrTable1: String,
+    iAttrTable1: String) {
+    val t0 = System.currentTimeMillis()
+    val userId = "RRT"
+    val namespace = "JANUARY"
+    val userIden = namespace+userId
+    val tableName = "T_USER_CONF"
+    val rec = ReadData.getUserInfo(sc, namespace, tableName, userIden)  
+    val graph = GraphModel.createGraph(sc, namespace1, edgeTable1, pAttrTable1, iAttrTable1, rec)
+    val t1 = System.currentTimeMillis()
+    logger.warn("生成全量图用时："+(t1-t0))
+    graph.vertices.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/vertices1")
+    graph.edges.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/edges1")
+    logger.warn("全量数据生成图成功")
+  }
+}
+

@@ -1,0 +1,215 @@
+package com.wdcloud.graphx.recommend
+
+import java.io.File
+import java.io.FileOutputStream
+import java.io.PrintStream
+import java.io.Serializable
+import org.apache.spark.graphx.VertexId
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.VertexRDD
+import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
+
+import akka.event.slf4j.Logger
+import org.apache.spark.SparkConf
+import org.apache.spark.graphx.EdgeDirection
+import com.wdcloud.graphx.model.graph.GraphModel
+import com.wdcloud.graphx.scalaUtil.DataToJson
+import com.wdcloud.graphx.scalaUtil.Producer
+import com.wdcloud.graphx.model.graph.ReadData
+
+/**
+ * 使用spark-graphx实现基于好友、圈子来实现推荐二度好友、圈子、物品
+ * 		要求：1.离线的、全量的；
+ * 				 2.各种关系基于不同权重进行推荐
+ *
+ * jobserver调用
+ *
+ */
+object RecEng extends Serializable {
+
+  val logger = Logger(this.getClass.getName)
+
+  def createGraph(
+    sc: SparkContext,
+    namespace: String,
+    edgeTable: String,  
+    pAttrTable: String,
+    iAttrTable: String,
+    vertexPath: String,
+    edgePath: String
+  ){
+    //创建图
+    val userId = "RRT"
+    val namespace = "JANUARY"
+    val userIden = namespace+userId
+    val tableName = "T_USER_CONF"
+    val rec = ReadData.getUserInfo(sc, namespace, tableName, userIden)
+    val graph = GraphModel.createGraph(sc, namespace, edgeTable, pAttrTable, iAttrTable,rec)
+    graph.vertices.saveAsObjectFile(vertexPath)
+    graph.edges.saveAsObjectFile(edgePath)
+
+    logger.warn("创建图完成，顶点数是：" + graph.vertices.count())
+  }
+  
+  def startRecEntry(
+    sc: SparkContext,
+    namespace: String,
+    edgeTable: String,  
+    pAttrTable: String,
+    iAttrTable: String,
+		vertexPath: String,
+		edgePath: String
+  ){  
+    val t0 = System.currentTimeMillis()
+    val vertices = sc.objectFile[(Long, Map[String, Object])](vertexPath)
+    val edges = sc.objectFile[Edge[Double]](edgePath)
+    val graph = Graph(vertices, edges)
+    
+    val recCode = new RecCodeForAllUser(graph, namespace)   
+    val recResult = recCode.recForUsers()
+    
+    //将结果转化为json格式
+    val jsonResult = DataToJson.recResultRDDToJson(recResult).cache()
+
+    //将结果放到kafka中
+    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)
+    val t1 = System.currentTimeMillis()
+    logger.warn("合并推荐结果结束,推荐一共用时："+(t1-t0))
+    val fs = new FileOutputStream(
+    		new File("/wdcloud/app/spark/data/rec_jobserver_result/recResultForAllUser.log"));
+    val p = new PrintStream(fs);
+    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2}***${x._3.mkString(",")}"))
+    logger.warn("全量推荐结束")
+  }
+  
+  
+//  def startRecEntry1(
+//    sc: SparkContext,
+//    namespace: String,
+//    edgeTable: String,  
+//    pAttrTable: String,
+//    iAttrTable: String    
+//  ){  
+//    //创建图
+//    val graph = CreateGraph.createGraph(sc, namespace, edgeTable, pAttrTable, iAttrTable)
+//    
+//    val recCode = new RecCode(graph, namespace)
+//    val recResult = recCode.recForUsers(userIdListStr)
+//    val fs = new FileOutputStream(
+//    		new File("/wdcloud/app/spark/data/rec_jobserver_result/recResult1.log"));
+//    val p = new PrintStream(fs);
+//    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2}***${x._3.mkString(",")}"))
+//
+//    //将结果转化为json格式
+//    val jsonResult = DataToJson.recResultRDDToJson(recResult).cache()
+//
+//    //将结果放到kafka中
+//    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)
+//    logger.warn("合并推荐结果结束")
+//  }  
+//  def startRec(
+//    sc: SparkContext,
+//    namespace: String,
+//    edgeTable: String,
+//    pAttrTable: String,
+//    iAttrTable: String) {
+//    val t0 = System.currentTimeMillis()
+//    //创建图
+//    val graph = CreateGraph.createGraph(sc, namespace, edgeTable, pAttrTable, iAttrTable)
+//    val p1 = 8081089660629126378L
+//    val p2 = 6540510001309664609L
+//    val userIdList: List[VertexId] = List(p1,p2)
+//    val subGraph = CreateSubGraph.createSubGraph(graph, userIdList)
+//    subGraph.vertices.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/vertices")
+//    subGraph.edges.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/edges")
+//
+//    //释放内存资源
+//    graph.unpersistVertices(blocking = false)
+//    graph.edges.unpersist(blocking = false)
+//    val t1 = System.currentTimeMillis()
+//    logger.warn("创建图共用时：" + (t1 - t0))
+//    logger.warn("顶点数是：" + graph.vertices.count())
+//    Thread.sleep(5000)
+//  }  
+//
+//  def startRec1(
+//    sc: SparkContext,
+//    namespace: String) {
+//    val t0 = System.currentTimeMillis()
+//    val vertices = sc.objectFile[(Long, Map[String, Object])]("hdfs://192.168.6.84:9000/graph/vertices2")
+//    val edges = sc.objectFile[Edge[Double]]("hdfs://192.168.6.84:9000/graph/edges2")
+//    val graph = Graph(vertices, edges)
+//
+//    //调用推荐算法进行推荐结果的计算           
+//    val recCode = new RecCode(graph, namespace)
+//    val recResult = recCode.recBasedSimUser(graph)
+//    recResult.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/resultBasedSimUser")
+//    val t1 = System.currentTimeMillis()
+//    logger.warn("基于好友推荐共用时：" + (t1 - t0))
+//    Thread.sleep(5000)
+//    logger.warn("基于好友推荐结束")
+//    val fs = new FileOutputStream(
+//      new File("/wdcloud/app/spark/data/rec_jobserver_result/recResult1.log"));
+//    val p = new PrintStream(fs);
+//    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2._1}***${x._2._2.mkString(",")}"))
+//  }
+//
+//  def startRec2(
+//    sc: SparkContext,
+//    namespace: String) {
+//    val t0 = System.currentTimeMillis()
+//    val vertices = sc.objectFile[(Long, Map[String, Object])]("hdfs://192.168.6.84:9000/graph/vertices2")
+//    val edges = sc.objectFile[Edge[Double]]("hdfs://192.168.6.84:9000/graph/edges2")
+//    val graph = Graph(vertices, edges)
+//
+//    //调用推荐算法进行推荐结果的计算           
+//    val recCode = new RecCode(graph, namespace)
+//    val recResult = recCode.recICUForUserBasedCircle(graph)
+//    recResult.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/resultBasedCircle3")
+//    val t1 = System.currentTimeMillis()
+//    logger.warn("基于圈子推荐共用时：" + (t1 - t0))
+//
+//    Thread.sleep(5000)
+//    logger.warn("基于圈子推荐结束,顶点数是：" + vertices.count())
+//    val fs = new FileOutputStream(
+//      new File("/wdcloud/app/spark/data/rec_jobserver_result/recResult2.log"));
+//    val p = new PrintStream(fs);
+//    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2._1}***${x._2._2.mkString(",")}"))
+//  }
+//
+//  def startRec3(
+//    sc: SparkContext,
+//    namespace: String) {
+//    val t0 = System.currentTimeMillis()
+//    val vertices = sc.objectFile[(Long, Map[String, Object])]("hdfs://192.168.6.84:9000/graph/vertices1")
+//    val edges = sc.objectFile[Edge[Double]]("hdfs://192.168.6.84:9000/graph/edges1")
+//    val graph = Graph(vertices, edges)
+//
+//    val resultBasedCircle = sc.objectFile[(VertexId, (String, Map[String, List[(String, Double)]]))]("hdfs://192.168.6.84:9000/graph/resultBasedCircle1")
+//    val resultBasedSimUser = sc.objectFile[(VertexId, (String, Map[String, List[(String, Double)]]))]("hdfs://192.168.6.84:9000/graph/resultBasedSimUser")
+//    //调用推荐算法进行推荐结果的计算           
+//    val recCode = new RecCode(graph, namespace)
+//    val recResult = recCode.combineResult(graph, namespace, resultBasedSimUser, resultBasedCircle)
+//
+//    //将结果转化为json格式
+//    val jsonResult = DataToJson.recResultRDDToJson(recResult).cache()
+//
+//    //将结果放到kafka中
+//    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)
+//    recResult.saveAsObjectFile("hdfs://192.168.6.84:9000/graph/result1")
+//    val t1 = System.currentTimeMillis()
+//    logger.warn("合并结果共用时：" + (t1 - t0))
+//    Thread.sleep(5000)
+//    logger.warn("合并结果结束")
+//    val fs = new FileOutputStream(
+//      new File("/wdcloud/app/spark/data/rec_jobserver_result/recResult3.log"));
+//    val p = new PrintStream(fs);
+//    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2}***${x._3.mkString(",")}"))
+//    logger.warn("合并推荐结果结束")
+//  }
+
+}
+

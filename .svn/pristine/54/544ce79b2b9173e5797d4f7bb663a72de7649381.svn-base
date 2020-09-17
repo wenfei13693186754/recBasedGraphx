@@ -1,0 +1,125 @@
+package com.wdcloud.graphx.model.graph
+
+import java.io.Serializable
+
+import org.apache.spark._
+import org.apache.spark.graphx._
+import org.apache.spark.graphx.Graph.graphToGraphOps
+
+import com.wdcloud.graphx.model.graph.ReadData
+
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.scalaUtil.HbaseUtil
+
+/*   
+ * 创建图  
+ * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的apply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+ * Double是Edge上的属性的类型  
+ */
+object GraphModel extends Serializable{
+	val logger = Logger(this.getClass.getName)
+	
+	
+	def createGraph(sc: SparkContext, namespace: String, edgeTable: String, pAttrTable: String, iAttrTable: String, rec: Array[(String, String)]): Graph[Map[String, Object], Double] = {
+    //创建边RDD
+    val edges = ReadData.readEdgesData(sc, s"${namespace}:${edgeTable}", rec)  
+ 
+    //创建顶点RDD
+    val vertex = ReadData.readPersonAttrData(sc, s"${namespace}:${pAttrTable}").++(ReadData.readItemAttrData(sc, s"${namespace}:${iAttrTable}"))
+    //利用 fromEdges建立图          
+    //创建中间图，并缓存
+    val graph = Graph(vertex, edges)
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)  
+    
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val fGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost)).cache()
+    //合并边，调用groupEdges时要先调用partitionBy
+    val ffGraph = fGraph.partitionBy(PartitionStrategy.EdgePartition1D,10).groupEdges(merge = (e1, e2) => (e1 + e2)).cache()
+    
+    //释放资源  
+    fGraph.unpersistVertices(blocking = false)
+    fGraph.edges.unpersist(blocking = false)
+    ffGraph
+  }
+  
+  def createGraphFromEdges(sc: SparkContext, namespace: String, edgeTable: String, rec: Array[(String, String)]): Graph[Map[String, Object], Double] = {
+    val logger = Logger(this.getClass.getName)
+    //创建边RDD
+    val edges = ReadData.readEdgesData(sc, s"${namespace}:${edgeTable}", rec).cache()
+    
+    //将用户对物品的评分保存到hbase中
+    HbaseUtil.writeUserItemScore(namespace, "T_USER_ITEM_SCORE", edges.collect())
+      
+    //创建顶点RDD
+    val vertex = ReadData.readVertexData(sc, s"${namespace}:${edgeTable}")
+    
+    //创建中间图，并缓存
+    val graph = Graph(vertex, edges)
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)
+    
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val fGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost)).cache()
+    
+    //合并边，调用groupEdges时要先调用partitionBy
+    val ffGraph = fGraph.partitionBy(PartitionStrategy.EdgePartition1D,10).groupEdges(merge = (e1, e2) => (e1 + e2)).cache()
+    
+    logger.warn("图创建成功")
+    
+    //释放资源
+    fGraph.unpersistVertices(blocking = false)
+    fGraph.edges.unpersist(blocking = false)
+    ffGraph
+  }
+  
+  /**
+   * 将图进行持久化到hdfs中
+   * 
+   * param:
+   * 	graph: 需要持久化的图
+   *  path: 持久化图的基础路径
+   * return：
+   * 	持久化是否成功
+   * 
+   */
+  def saveGraph(graph: Graph[Map[String, Object], Double], path: String): Unit = {
+    
+    val vertexPath = path+"/vertex"
+    val edgePath = path+"/edge"
+    graph.vertices.saveAsObjectFile(vertexPath)
+    graph.edges.saveAsObjectFile(edgePath)
+    
+    logger.warn("图持久化完成，持久化路径是： " + graph.vertices.count())
+  }  
+  
+  /**
+   * 从hdfs中读出持久化好的图
+   * 
+   * param:
+   * 		sc: spark程序运行上下文
+   * 		path: 持久化图的基础路径，图信息需要从这个路径下读取
+   * return:
+   * 		之前持久化好的图
+   */
+  def getGraph(sc: SparkContext, path: String): Graph[Map[String, Object], Double] = {
+    val vertexPath = path+"/vertex"
+    val edgePath = path+"/edge"
+    val vertices = sc.objectFile[(Long, Map[String, Object])](vertexPath)
+    val edges = sc.objectFile[Edge[Double]](edgePath)
+    Graph(vertices, edges)
+  }
+  
+}
+
+
+
+
+
+
+
+
+
+
+
+

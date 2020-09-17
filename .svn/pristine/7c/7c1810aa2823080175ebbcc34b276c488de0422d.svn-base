@@ -1,0 +1,142 @@
+package com.wdcloud.graphx.test
+
+import scala.math._
+import org.apache.spark._
+import org.apache.spark.graphx._
+import org.apache.spark.rdd.RDD
+import com.wdcloud.graphx.unit.TimeOperate
+import com.google.common.hash.Hashing
+import org.apache.spark.graphx.Graph.graphToGraphOps
+
+object CreateGraphxBasedText {
+  
+  val projectDir = "E:\\spark\\Spark-GraphX\\data\\"
+  val id = "recFriendsItemAndCircle\\relInGood"
+  val sc = CreateSparkContext.init()
+  def main(args: Array[String]): Unit = {
+    createGraph()
+    println("图创建成功")
+  }  
+  /*
+   * 创建图
+   * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的aply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+   * Double是Edge上的属性的类型
+   */
+  def createGraph(): Graph[Map[String, Object], Double] = {
+
+    //**************************创建图,图的每个边上放着物之间的共同特征数(包括人与人，人与物，物与物)********
+
+    //调用时间操作工具类，用来算出用户与好友最近一次交互时间与当前时间的时间差
+    val timeUtil = new TimeOperate()
+
+    //创建一个累加器,用来计算读取到的数据行数
+    var countNum = sc.accumulator(0)
+    //创建累加器用来累加用户之间的交互次数
+    var countScore = sc.accumulator(0)
+
+   //通过 .edges 文件计算边，得到两个用户之间的关系 并且计算他们相同特征的个数
+    val edgesData = sc.textFile(projectDir+id+".edges").map {
+      line =>
+        if (line.isEmpty()) {  
+        	(0L,0L,0,0)
+        }
+        //累加器加1
+        countNum.+=(1)
+      	val row = line.split("\\|")
+      	if (row.length < 3) {
+      	  throw new IllegalArgumentException("Invalid line at "+countNum+"row, line is "+line+"  "+row(0).mkString(","))
+      	}
+        
+  			val ids = row(0).split(" ")
+  			//生成srcId
+  			val srcArr = ids(0).split(":") 
+  			val srcId = hashId(srcArr(1), srcArr(0))
+  			//生成dstId
+  			val dstArr = ids(1).split(":")
+  			val dstId = hashId(dstArr(1), dstArr(0))
+  			//计算user和一度好友交流的总次数，包括点赞、聊天等
+  			val communicateNumArray: Array[Int] = row(2).split(" ").map { x => x.toInt }
+  			val communicateNum = communicateNumArray.aggregate(0)({ (sum,ch) => sum + ch}, { (p1,p2) => p1+p2})
+  			
+  			//累加交互次数
+  			countScore.+=(communicateNum)
+  			
+  			//计算user和一度好友的最近一次交互的时间与当前时间的差
+  			val time = new TimeOperate().DealTime(row(3))
+  			//val time = row(3)
+				(srcId,dstId,communicateNum,time.toLong)
+    }
+    
+    //计算出user和一度好友的总的交互次数和总的交互的时间差的和
+    //val userData = edgesData.map(x => x._3).reduce( (x,y) => x+y)
+    //val comAvg: Double = userData/countNum.value//平均交互次数
+    edgesData.count()
+    println("总的交互次数是："+countScore)
+    //计算出user和一度好友的平均交互次数和平均共有特征数量
+    val comAvg: Double = countScore.value/countNum.value//平均交互次数
+    
+    //调用countCohesion方法计算user和一度好友之间的亲密度
+    val finallyCohesion = countCohesion(edgesData,comAvg)
+    //创建边  
+    val edges = finallyCohesion.map(x => Edge(x._1,x._2,x._3))
+
+    //通过.txt文件计算出图的顶点，顶点的一个属性是该顶点所属的类别，是人还是物
+    val vertex = sc.textFile(projectDir + id + ".attr").map {
+      line =>
+        var srcId: Long = 0L
+        val row = line.split("\\|")
+        val arr = row(1).split(" ")
+        srcId = hashId(arr(0), row(0))
+        //对于圈子作为一个顶点存在的话，使用如下代码
+        //将属性添加到map集合中
+        //person_1|person girl 25 beijing rose 1 2 邻居id 
+        var attr: Map[String, Object] = Map("type" -> arr(0),"businessId" -> row(0), "gender" -> arr(1), "年龄" -> arr(2), "住址" -> arr(3), "姓名" -> arr(4),
+            "life" -> arr(6), "other" -> arr(7))
+        (srcId, attr)
+    }
+    //利用 fromEdges建立图 
+    val graph = Graph(vertex, edges).cache
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val finallyGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost))
+    finallyGraph
+  }
+  
+  
+  
+  /*
+   * 计算user和一度好友之间的亲密度
+   * edgeData[(Long, Long, Int, Long)]
+   * 				srcId,dstId,communicateNum,time（time代表的是用户之间最近一次交互的时间和当前时间的时间差） 
+   * comAvg:用户之间的平均交互次数；
+   * 
+   * 返回值：RDD[(long,long,Double)]-->(srcId,dstId,score)
+   */
+  def countCohesion(edgeData: RDD[(Long, Long, Int, Long)], comAvg: Double): RDD[(Long, Long, Double)] = {
+    //计算亲密度
+    val cohesion = edgeData.map { x =>
+      var scoreCom: Double = 0
+      var totalScore: Double = 0
+      if (comAvg != 0) {
+        scoreCom = (x._3 - comAvg) * 0.6 / comAvg
+        //时间差的指数作为分母
+        totalScore = scoreCom / math.pow(x._4 / 3600000, 1.5)
+      } else {
+        totalScore = -1.0
+      } 
+      (x._1, x._2, totalScore)
+    }
+
+    //cohesion.foreach { x => println(x._1+" 与 "+x._2+" 相似度是  "+x._3) }
+    cohesion
+  }
+
+  /*
+   * 标识不同物品id的工具方法
+   */
+  //Hashing方法
+  def hashId(name: String, str: String) = {
+    Hashing.md5().hashString(name+""+str).asLong()
+  }
+}

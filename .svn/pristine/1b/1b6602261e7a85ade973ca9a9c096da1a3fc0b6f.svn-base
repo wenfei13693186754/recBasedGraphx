@@ -1,0 +1,67 @@
+package com.wdcloud.graphx.modelBuild.graph.create
+
+import java.io.Serializable
+
+import org.apache.spark.graphx.Graph.graphToGraphOps
+
+import org.apache.spark.SparkContext
+import com.wdcloud.graphx.scalaUtil.HbaseUtil
+import org.apache.spark.graphx.Graph
+import com.wdcloud.graphx.javaUtil.Configuration
+import akka.event.slf4j.Logger
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.PartitionStrategy
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.modelBuild.graph.ReadData
+import com.wdcloud.graphx.modelBuild.graph.GraphModel
+import com.wdcloud.graphx.environmentContext.DataContext
+
+/*   
+ * 创建图  
+ * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的apply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+ * Double是Edge上的属性的类型  
+ */
+class CreateGraphModelByHbase extends GraphModel {
+  
+	val logger = Logger(this.getClass.getName)
+  var conf: Configuration = null
+	
+	override def createGraph(sc: SparkContext): Graph[Map[String, Object], Double] = {  
+	  ReadData.conf = conf
+	  
+	  //创建边RDD
+    val edges = ReadData.readEdgesData(sc)  
+ 
+    //创建顶点RDD
+    val vertex = ReadData.readPersonAttrData(sc).++(ReadData.readItemAttrData(sc))
+    //创建中间图，并缓存  
+    val graph = Graph(vertex, edges)  
+    
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)  
+    
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val fGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost)).cache()
+    //合并边，调用groupEdges时要先调用partitionBy
+    val ffGraph = fGraph.partitionBy(PartitionStrategy.EdgePartition1D,10).groupEdges(merge = (e1, e2) => (e1 + e2)).cache()
+    
+    //释放资源  
+    fGraph.unpersistVertices(blocking = false)
+    fGraph.edges.unpersist(blocking = false)
+    
+    logger.warn("读取hbase中源数据生成图模型成功")
+    
+    ffGraph
+  }
+}
+
+
+
+
+
+
+
+
+
+

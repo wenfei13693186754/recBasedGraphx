@@ -1,0 +1,125 @@
+package com.wdcloud.graphx.modelTraining.graph
+
+import org.apache.spark.rdd.RDD
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.VertexId
+import scala.Iterator
+import com.wdcloud.graphx.scalaUtil.PregelUtil
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.javaUtil.Configuration
+import com.wdcloud.graphx.scalaUtil.HbaseUtil
+import com.wdcloud.graphx.modelTraining.graph.util.GraphResultHandle
+import com.wdcloud.graphx.modelTraining.Recommender
+import com.wdcloud.graphx.environmentContext.DataContext
+import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.SparkContext
+import com.wdcloud.graphx.modelBuild.graph.ReadData
+import scala.collection.mutable.Map
+/**
+ * 进行基于圈子的推荐
+ * 	向用户推荐，和他在一个圈子的其它人所关系的物品，但是他没关系的物品
+ */
+class MixCommunityRecommender(userConf: Map[String, String]) extends Recommender(userConf){
+
+  val logger = Logger(this.getClass.getName)
+  var middleResult: RDD[(VertexId, Map[Long, List[(Long, Double)]])] = null
+
+  /**  
+   * 基于圈子对用户进行全量推荐好友、物品和圈子
+   * 步骤如下：首先所有顶点发送信息给src顶点，也就是user顶点，user顶点收到消息后将该消息以kv形式保存到map属性中；然后第二次迭代user顶点发送它们收到的消息和它们自己的属性给圈子顶点，
+   * 圈子顶点收到消息后以kv形式保存到map属性中；最后第三次迭代圈子顶点将收到的消息发送到user顶点。user顶点收到消息后从消息中去除掉自己直接关系的顶点信息并且对结果进行合并，作为最终的推荐结果。
+   * 其间要将图上的hash后的id值转化为业务id后作为处理结果返回。
+   * 
+   * 迭代过程中使用自定义的PregelUtil的成员变量iterNum来断定迭代次数
+   * 	iterNum初始值是0，没进行一次迭代增加1
+   * 
+   * 另外，迭代过程中使用的都是可变的集合类型，这样避免了在迭代过程中产生过多的中间结果
+   *  @param sc SparkContext
+   *  @param graphModel 推荐所使用的图模型
+ 	 *  @return RDD[(Int, Long, Map[Long, List[(Long, Double)]])]-->RDD[(命名空间名称, 用户的inner_Id, Map[推荐物品类型, List[(推荐物品inner_Id, score)]])]
+   */
+  def predict(sc: SparkContext, graphModel: Graph[Map[Int, Any], Double]): RDD[(Int, Long, Map[Long, List[(Long, Double)]])] = {
+    logger.warn("开始基于圈子的推荐")
+    val namespace = userConf.get("namespace").get
+    val graph = sc.broadcast(graphModel)
+    val PregelUtil = new PregelUtil()
+    val filterType: Long = 4026302790726841481L
+    val recID: Int = ReadData.pointAttrMap.get("rec").get 
+    val typeID: Int = ReadData.pointAttrMap.get("type").get
+    //调用自定义的pregel方法
+    val pregelGraph = PregelUtil.apply(graph.value, List[(VertexId, (Long, Double))](), 3, EdgeDirection.Either)(
+      (vId, oldAttr, newAttr) =>
+        if (newAttr.size == 0) { //初始化
+
+          oldAttr ////Map[被推荐物品的类型, List[(物品的innerId, Score)]]()
+        } else if (PregelUtil.iterNum == 3) { //第三次迭代，将圈子上的推荐信息聚合到圈子的直接关系用户上
+          val dealData = GraphResultHandle.finallyPointResultHandle(oldAttr, newAttr, vId)
+          //将处理后的信息保存到map中
+          oldAttr.update(recID, dealData)
+          oldAttr
+        } else { //第一次和第二次迭代
+          
+          oldAttr.updated(recID, newAttr)
+        },
+
+      triplet =>
+        if (PregelUtil.iterNum == 0) { //初始化后第一次迭代
+          val dstAttr = triplet.dstAttr
+          Iterator((triplet.srcId, List((triplet.dstId, (dstAttr.apply(typeID).asInstanceOf[Long], triplet.attr)))))
+
+        } else if (PregelUtil.iterNum == 1 && triplet.dstAttr.apply(typeID).asInstanceOf[Long] == filterType) { //第二次迭代，开始发送消息到圈子顶点了
+
+          val srcAttr = triplet.srcAttr
+          //获取到圈子的一度用户和用户的下一级直接关系物品的亲密度score，格式是:List[(VertexId, (Long, Double))]，乘上圈子和直接用户的score作为圈子二度关系物品的得分
+          //然后重新组成字符串发送到圈子节点上
+          if (!srcAttr.get(recID).isEmpty) {
+
+            val attr = srcAttr.apply(recID).asInstanceOf[List[(VertexId, (Long, Double))]].map { x =>
+              val score = x._2._2 * triplet.attr.toDouble
+              (x._1, (x._2._1, score))
+            }
+
+            //因为基于圈子给用户推荐好友，圈子的直接关系用户被推荐给圈子的另一个用户的概率理论会远远大于圈子的二度用户，所以这里将圈子的直接关系用户顶点添加到发送的消息中
+            val userInfo: List[(VertexId, (Long, Double))] = List((triplet.srcId, (srcAttr.apply(typeID).asInstanceOf[Long], triplet.attr)))
+            //将圈子的直接关系用户顶点信息追加到attr上
+            val newAttr = attr.:::(userInfo)
+
+            //将用户顶点上第一次迭代收到的消息置为空，以腾出所占用的内存
+            srcAttr.remove(recID)
+            triplet.dstAttr.remove(recID)
+            //将消息发送到圈子节点上
+            Iterator((triplet.dstId, newAttr))
+          } else {
+            Iterator.empty
+          }
+
+        } else if (PregelUtil.iterNum == 2) { //第三次迭代，将圈子上的推荐信息聚合到圈子直接相关的人上
+          val dstAttr = triplet.dstAttr
+          val srcAttr = triplet.srcAttr
+          if (!dstAttr.get(recID).isEmpty) {
+            val sendMsg = dstAttr.apply(recID).asInstanceOf[List[(VertexId, (Long, Double))]]
+            //将圈子上第二次迭代收到的消息置为空，以腾出所占用的空间
+            srcAttr.remove(3)
+            dstAttr.remove(3)
+            Iterator((triplet.srcId, sendMsg))
+
+          } else {
+            Iterator.empty
+          }
+        } else {
+
+          Iterator.empty
+        },
+      (data1, data2) => data1.:::(data2)).cache
+    middleResult = GraphResultHandle.recResultHandle(pregelGraph)
+    //将结果保存到hbase中
+    //HbaseUtil.writeRecInfoBasedCircle(namespace, "T_REC_BASEDCIRCLE", middleResult.collect())  
+
+    logger.warn("基于圈子的推荐成功")
+
+    middleResult.reduceByKey((x, y) => GraphResultHandle.mapCombine(x, y)).map(x => (0, x._1, x._2))
+
+  }
+
+}

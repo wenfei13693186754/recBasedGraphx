@@ -1,0 +1,61 @@
+package com.wdcloud.graphx.modelBuild.graph.create
+
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import org.apache.spark.rdd.RDD
+import org.apache.spark._
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.javaUtil.TimeOperate
+import com.wdcloud.graphx.scalaUtil.CreateSparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.EdgeDirection
+import com.wdcloud.graphx.javaUtil.Configuration
+import com.wdcloud.graphx.modelBuild.graph.GraphModel
+import scala.collection.mutable.Map
+import com.wdcloud.graphx.modelBuild.graph.ReadDataFromTxt
+import com.wdcloud.graphx.modelBuild.graph.ReadDataFromHbase
+import org.apache.spark.graphx.VertexRDD
+import org.apache.spark.graphx.PartitionStrategy
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.pojo.UserMapInfo
+
+/**
+ * 读取txt文件中的数据，生成图模型
+ */
+class CreateGraphModelByTxt extends GraphModel with Serializable{
+  
+  val logger = Logger(this.getClass.getName)  
+  /*
+   * 创建图
+   * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的aply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+   * Double是Edge上的属性的类型
+   */
+  override def createGraph(sc: SparkContext, conf: Configuration): Graph[Map[Int, Any], Double] = {
+    
+    val graphData = ReadDataFromTxt.readGraphData(sc, conf) 
+    val edges = graphData.map(x => Edge(x._1, x._2, x._3))
+
+    val vt1 = graphData.map(x => (x._1, x._4)) 
+    val vt2 = graphData.map(x => (x._2, x._5))  
+    val vertex = VertexRDD(vt1.union(vt2))
+    //创建中间图，并缓存
+    val graph: Graph[Map[Int, Any], Double] = Graph(vertex, edges).partitionBy(PartitionStrategy.EdgePartition2D, 6).cache()
+    
+    //全图操作，每个顶点收集自己邻居顶点id
+    val neighIds = graph.collectNeighborIds(EdgeDirection.Either)
+
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val fGraph = graph
+      .joinVertices(neighIds)((id, oldCost, extraCost) => oldCost.+(UserMapInfo.pointAttrMap.get("neiborId").get -> extraCost))
+      .groupEdges((e1, e2) => (e1 + e2)) //合并边，调用groupEdges时要先调用partitionBy
+      .cache()
+    
+    //释放资源
+    graphData.unpersist(blocking = false)
+    graph.unpersistVertices(blocking = false)
+    graph.edges.unpersist(blocking = false)
+    logger.warn("读取txt中边数据生成图成功")
+
+    fGraph
+  } 
+}

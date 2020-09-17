@@ -1,0 +1,43 @@
+package com.wdcloud.graphx.jobServer
+
+import scala.util.Try
+
+import org.apache.spark.SparkContext
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+import com.typesafe.config.Config
+
+import spark.jobserver.SparkJob
+import spark.jobserver.SparkJobInvalid
+import spark.jobserver.SparkJobValid
+import spark.jobserver.SparkJobValidation
+import com.wdcloud.graphx.graphOperate.RecBasedGraphx
+
+/**
+ * Spark JobServer测试
+ * http://debugo.com/jobserver-project-namedrdd/
+ * 前者用于验证（如下面代码验证了input.string中需要有指定的内容），还可以验证HDFS或者其他配置信息。
+ * 后者为job的执行代码（需要传入一个SparkContext，同样需要config，config中包含*.conf的信息）
+ */
+class RecBasedGraphxServer extends Serializable with SparkJob {
+
+  override def validate(sc: SparkContext, config: Config): SparkJobValidation = {
+    Try(config.getString("namespace"))
+      .map(x => SparkJobValid)
+      .getOrElse(SparkJobInvalid("No namespace config param"))
+  }
+
+  override def runJob(sc: SparkContext, config: Config): Unit = {
+   // RecBasedGraphx.startRec(sc, config.getString("namespace").toUpperCase())     
+  }
+}
+
+
+
+
+
+
+
+
+
+

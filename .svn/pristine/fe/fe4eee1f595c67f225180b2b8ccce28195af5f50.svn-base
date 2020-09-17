@@ -1,0 +1,58 @@
+package com.wdcloud.graphx.modelBuild.graph.create
+
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import org.apache.spark.graphx.PartitionStrategy
+
+import com.wdcloud.graphx.javaUtil.Configuration
+import com.wdcloud.graphx.scalaUtil.HbaseUtil
+
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.modelBuild.graph.ReadData
+import com.wdcloud.graphx.modelBuild.graph.GraphModel
+import com.wdcloud.graphx.environmentContext.DataContext
+import org.apache.spark.storage.StorageLevel
+import com.wdcloud.graphx.environmentContext.DataContext
+
+/**
+ * 通过边数据生成图
+ */
+class CreateGraphModelFromEdgeByHbase extends GraphModel {
+
+  val logger = Logger(this.getClass.getName)
+
+  override def createGraph(sc: SparkContext): Graph[Map[String, Object], Double] = {
+
+    //创建边RDD
+    val edges = ReadData.readEdgesData(sc)
+    //读取顶点类型
+    val vType = ReadData.readTypeFromEdgeData(sc)
+    //创建中间图，并缓存
+    val defaultValue = Map[String, Object]()
+    val graph = Graph.fromEdges(edges, defaultValue)
+
+    //将顶点属性type添加到各个顶点上
+    val vtGraph = graph.joinVertices(vType)((id, oldCost, extraCost) => oldCost.++(extraCost)).cache()
+
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)
+
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val fGraph = vtGraph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost)).cache()
+
+    //合并边，调用groupEdges时要先调用partitionBy
+    val ffGraph = fGraph.partitionBy(PartitionStrategy.EdgePartition1D, 20).groupEdges(merge = (e1, e2) => (e1 + e2)).cache()
+    logger.warn("开始释放中间图")
+    //释放资源
+    vtGraph.unpersistVertices(blocking = false)
+    vtGraph.edges.unpersist(blocking = false).count()
+    fGraph.unpersistVertices(blocking = false)
+    fGraph.edges.unpersist(blocking = false).count()
+    logger.warn("中间图释放完成")
+    logger.warn("读取hbase中边数据生成图成功")
+
+    ffGraph
+  }
+}

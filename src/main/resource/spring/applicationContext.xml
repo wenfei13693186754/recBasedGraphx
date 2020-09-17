@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>  
+<beans  
+	xmlns="http://www.springframework.org/schema/beans"  
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"  
+	xmlns:tx="http://www.springframework.org/schema/tx"  
+	xmlns:context="http://www.springframework.org/schema/context"    
+	xmlns:mvc="http://www.springframework.org/schema/mvc"    
+	xsi:schemaLocation="
+	http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd   
+	http://www.springframework.org/schema/tx http://www.springframework.org/schema/tx/spring-tx.xsd  
+	http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context.xsd  
+	http://www.springframework.org/schema/mvc http://www.springframework.org/schema/mvc/spring-mvc.xsd" 
+	default-autowire="byName">
+	
+	<mvc:annotation-driven />  
+	
+	<!-- @Service -->
+    <context:component-scan base-package="com.wdcloud">
+    	<context:include-filter type="annotation" expression="org.springframework.stereotype.Service"/>
+    </context:component-scan>
+    
+    <bean scope="singleton" id="propertyConfigurer"
+		class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+		<property name="locations">
+			<list>
+				<value>classpath*:conf/kafka.properties</value>
+			</list>
+		</property>
+	</bean>
+    
+    <bean id="producerConn" class="com.wdcloud.kafka.producer.connection.ProducerConn" init-method="initConn">
+    	<property name="METADATA_BROKER_LIST" value="${METADATA_BROKER_LIST}"/>
+    	<property name="SERIALIZER_CLASS" value="${SERIALIZER_CLASS}"/>
+    	<property name="REQUEST_REQUIRED_ACKS" value="${REQUEST_REQUIRED_ACKS}"/>
+    </bean>
+    
+<!--     <bean scope="singleton" id="consumerConn" class="com.wdcloud.kafka.consumer.ConsumerConn" init-method="startConsumer">
+    	<property name="ZOOKEEPER_CONNECT" value="${ZOOKEEPER_CONNECT}"/>
+    	<property name="GROUP_ID" value="${GROUP_ID}"></property>
+    	<property name="TOPIC" value="${TOPIC}"></property>
+    	<property name="ZOOKEEPER_SESSION_TIMEOUT_MS" value="${ZOOKEEPER_SESSION_TIMEOUT_MS}"/>
+    	<property name="ZOOKEEPER_SYNC_TIME_MS" value="${ZOOKEEPER_SYNC_TIME_MS}"/>
+    	<property name="AUTO_COMMIT_INTERVAL_MS" value="${AUTO_COMMIT_INTERVAL_MS}"/>
+    	<property name="AUTO_OFFSET_RESET" value="${AUTO_OFFSET_RESET}"/>
+    </bean> -->
+    
+    <!-- <bean id="kafkaConsumer" class="com.wdcloud.kafka.consumer.KafkaConsumer">
+    	<property name="hbaseInterface" ref="hbaseInterface"></property>
+    </bean> -->
+
+</beans>  

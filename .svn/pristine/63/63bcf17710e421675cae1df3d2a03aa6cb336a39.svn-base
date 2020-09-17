@@ -1,0 +1,14 @@
+package com.wdcloud.graphx.unit
+
+import com.google.common.hash.Hashing
+
+/*
+   * 标识不同物品id的工具方法
+   */
+class IdTransforByHash {
+  
+  //Hashing方法
+  def hashId(name: String, str: String) = {
+    Hashing.md5().hashString(name+""+str).asLong()
+  }
+}

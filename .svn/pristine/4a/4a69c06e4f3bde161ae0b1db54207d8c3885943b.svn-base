@@ -1,0 +1,25 @@
+package com.wdcloud.graphx.resultHandle.graph
+
+import org.apache.spark.rdd.RDD
+import com.wdcloud.graphx.scalaUtil.DataToJson
+import com.wdcloud.graphx.scalaUtil.Producer
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.environmentContext.DataContext
+import scala.collection.mutable.Map
+/**
+ * 保存推荐结果到kafka中
+ */
+class SaveResultToKafka(userConf: Map[String, String]) extends DataContext(userConf)  with SaveResult{
+    
+  val logger = Logger(this.getClass.getName)  
+  override def saveResult(result: RDD[(Int, String, Map[String, List[(String, Double)]])]){
+    
+    val namespace = userConf.get("namespace").get  
+    
+    //将结果转化为json格式   
+    val jsonResult = DataToJson.recResultRDDMapToJson(result).cache()
+    //将结果放到kafka中
+    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)
+    logger.warn("消息成功放到kafka中")
+  }   
+}

@@ -1,0 +1,134 @@
+package com.wdcloud.graphx.test
+
+import scala.math._
+import org.apache.spark._
+import org.apache.spark.graphx._
+import org.apache.spark.rdd.RDD
+import com.wdcloud.graphx.unit.TimeOperate
+import com.google.common.hash.Hashing
+import org.apache.spark.graphx.Graph.graphToGraphOps
+
+object CreateGraphxBasedText {
+  
+  val projectDir = "E:\\spark\\Spark-GraphX\\data\\"
+  val id = "recEng1_TestData\\relInGood"
+  val sc = CreateSparkContext.init()
+  def main(args: Array[String]): Unit = {
+    createGraph()
+    println("图创建成功")
+  }  
+  /*
+   * 创建图
+   * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的aply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+   * Double是Edge上的属性的类型
+   */
+  def createGraph(): Graph[Map[String, Object], Double] = {
+
+    //**************************创建图,图的每个边上放着物之间的共同特征数(包括人与人，人与物，物与物)********
+
+    //调用时间操作工具类，用来算出用户与好友最近一次交互时间与当前时间的时间差
+    val timeUtil = new TimeOperate()
+
+    //创建一个累加器,用来计算读取到的数据行数
+    var countNum = sc.accumulator(0)
+    //创建累加器用来累加用户之间的交互次数
+    var countScore = sc.accumulator(0)
+
+    //通过 .edges 文件计算边，得到两个用户之间的关系 并且计算他们相同特征的个数
+    //person_1 person circle_1 circle 1 1453128202076
+    val edges = sc.textFile("E:\\spark\\Spark-GraphX\\data\\job_server_test_data\\edge.txt").map {
+      line =>
+      	val row = line.split(" ")
+        
+  			//生成srcId
+  			val srcId = hashId(row(0), row(1))
+  			println(srcId+"|"+row(0)+"|"+row(1))
+  			//生成dstId
+  			val dstId = hashId(row(2), row(3))
+  			//读取行为类型
+  			val bhv_type = row(4)
+  			val relaScore: Double = bhv_type match {
+  			  case "0" => 1.0
+			    case "1" => 0.9
+		      case "2" => 0.8
+	        case "3" => 0.7
+          case "4" => 0.6
+          case "5" => 0.5
+          case "6" => 0.4
+          case "7" => 0.3
+          case _ => 0
+  			}
+  			
+  			//计算顶点之间亲密度
+  			var totalScore: Double = 0
+  			
+  			/*if(relaScore == 0.4 ||relaScore == 0.5){//是聊天、浏览
+  				//计算交互次数
+  			  val communicateNum = row(5).toInt
+  			  totalScore = math.log10(relaScore * communicateNum * 1000000 / math.pow(row(5).toLong / 36000000, 1.5) + 1)
+  			}else{*/
+  			  totalScore = math.log10(relaScore * 1000000 / math.pow(row(5).toLong / 360000000, 1.5) + 1)
+  			//}
+  			//println(row(0)+"和"+row(2)+"的亲密度是："+totalScore)
+				Edge(srcId,dstId,totalScore)
+    }
+    
+    //通过.txt文件计算出图的顶点，顶点的一个属性是该顶点所属的类别，是人还是物
+    val vertex = sc.textFile("E:\\spark\\Spark-GraphX\\data\\job_server_test_data\\pVertex.txt").map {
+      line =>
+        val arr = line.split(" ")
+        val srcId = hashId(arr(0), arr(1))
+        //对于圈子作为一个顶点存在的话，使用如下代码
+        //将属性添加到map集合中
+        //person_1|person girl 25 beijing rose 1 2 邻居id 
+        var attr: Map[String, Object] = Map("businessId" -> arr(0), "type" -> arr(1))
+        (srcId, attr)
+    }
+    //利用 fromEdges建立图 
+    val graph = Graph(vertex, edges).cache
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)
+    val num1 = graph.vertices.count()
+    val num2 = dealGraph.count()
+    println(num1+"||"+num2)
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val finallyGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost))
+    finallyGraph
+  }
+  
+  
+  /*
+   * 计算user和一度好友之间的亲密度
+   * edgeData[(Long, Long, Int, Long)]
+   * 				srcId,dstId,communicateNum,time（time代表的是用户之间最近一次交互的时间和当前时间的时间差） 
+   * comAvg:用户之间的平均交互次数；
+   * 
+   * 返回值：RDD[(long,long,Double)]-->(srcId,dstId,score)
+   */
+  def countCohesion(edgeData: RDD[(Long, Long, Int, Long)], comAvg: Double): RDD[(Long, Long, Double)] = {
+    //计算亲密度
+    val cohesion = edgeData.map { x =>
+      var scoreCom: Double = 0
+      var totalScore: Double = 0
+      if (comAvg != 0) {
+        scoreCom = (x._3 - comAvg) * 0.6 / comAvg
+        //时间差的指数作为分母
+        totalScore = scoreCom / math.pow(x._4 / 3600000, 1.5)
+      } else {
+        totalScore = -1.0
+      } 
+      (x._1, x._2, totalScore)
+    }
+
+    //cohesion.foreach { x => println(x._1+" 与 "+x._2+" 相似度是  "+x._3) }
+    cohesion
+  }
+
+  /*
+   * 标识不同物品id的工具方法
+   */
+  //Hashing方法
+  def hashId(name: String, str: String):Long = {
+    Hashing.md5().hashString(name+""+str).asLong()
+  }
+}

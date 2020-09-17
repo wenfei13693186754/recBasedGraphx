@@ -1,0 +1,144 @@
+package com.wdcloud.graphx.modelTraining.graph.util
+
+import scala.collection.JavaConverters._
+import scala.collection.mutable.Map
+import scala.collection.mutable.LinkedList
+import org.apache.spark.graphx.Graph
+import org.apache.spark.rdd.RDD
+import org.apache.spark.graphx.VertexId
+import com.wdcloud.graphx.modelBuild.graph.ReadData
+
+import it.unimi.dsi.fastutil.ints.Int2ObjectArrayMap
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
+
+object GraphResultHandle {
+
+  /**
+   * 对聚合到顶点上的最终的推荐结果进行处理，过滤掉邻居顶点，并对边进行合并，分数进行累加
+   * @param:
+   * 	oldAttr: Map[Int, Object]:每个顶点上的属性值，是map结构，map中使用kv格式保存着多个属性对
+   *  newAttr: List[(VertexId, (Int, Double))]:sendMsg发送来的数据。--->List[(顶点id, (顶点类型, score))]
+   *  vId: VertexId: 当前顶点hash后的id
+   * @return:Map[Long, List[(VertexId, Double)]]-->Map[推荐物品类型, List[(被推荐物品内部id, score)]]
+   */
+  def finallyPointResultHandle(oldAttr: Map[Int, Any], newAttr: List[(VertexId, (Long, Double))], vId: VertexId): Map[Long, List[(VertexId, Double)]] = {
+    //去除掉，推荐结果中的顶点的邻居顶点
+    val neiborIds = oldAttr.apply(2).asInstanceOf[Array[VertexId]]
+    val recResult = newAttr.filter(x => !neiborIds.contains(x._1) && vId != x._1)
+
+    //这个时候要对数据进行处理：包括对相同VertexId的数据进行分数累加去重和分组,最终存储的格式是：Map[type, List[(VertexId, Double)]]
+    val dealData = recResult.groupBy(x => x._1).map { x => //(VertexId, List[(VertexId, (Int, Double))])
+      x._2.reduce((x, y) => (x._1, (x._2._1, x._2._2 + y._2._2)))
+    }.groupBy(x => x._2._1).map(x => (x._1, (x._2.map(y => (y._1, y._2._2)).toList)))
+    val result = Map[Long, List[(VertexId, Double)]]()
+    result.++=(dealData)
+  }
+
+  /**
+   * 对pregel迭代出来的结果进行处理
+   * 		1. 对指定类型的顶点进行推荐(比如这里给person类型顶点进行推荐)
+   * 		2. 对那些key是"rec",value值不是Map的赋值为Map[String, List[(String, Double)]]()
+   * @param Graph[Map[Int, Object], Double]-->图模型
+   * @return RDD[(VertexId, (String, Map[String, List[(String, Double)]]))]-->RDD[(用户innerId, (用户业务id, Map[被推荐物品的类型, List[(被推荐给物品的业务id, score)]]))]
+   */
+  def recResultHandle(graph: Graph[Map[Int, Any], Double]): RDD[(VertexId, Map[Long, List[(Long, Double)]])] = {
+    val resultDatas = graph.vertices.filter(x => x._2.apply(1).asInstanceOf[Long] == 7986692084083535784L) //测试数据集中01(person)映射
+    val resultData = resultDatas .map(x =>
+        try {
+          if (x._2.apply(3).isInstanceOf[Map[Long, List[(Long, Double)]]]) {
+            (x._1, x._2.apply(3).asInstanceOf[Map[Long, List[(Long, Double)]]])
+          } else {
+            (x._1, Map[Long, List[(Long, Double)]]())
+          }
+        } catch {
+          case ex: NoSuchElementException => (x._1, Map[Long, List[(Long, Double)]]())
+        }).cache()
+    graph.unpersistVertices(blocking = false)
+    graph.edges.unpersist(blocking = false)
+    resultData
+  }
+
+  /*
+   * 将基于好友的推荐结果和基于圈子的推荐结果进行合并,并将合并好的数据放入到kafka中
+   * 传来的数据格式：List[(String, Map[String, List[(String, Double)]])]-->List[(用户的业务id, Map[推荐物品类型, List[(推荐物品业务id, score)]])]
+   * 返回的结果格式：RDD[(String, String, Map[String, List[(String, Double)]])]-->RDD[(命名空间名称, 用户的业务id, Map[推荐物品类型, List[(推荐物品业务id, score)]])]
+   * 
+   * 处理过程：
+   * 1.首先将传来的基于好友的推荐结果和基于圈子的推荐结果合并为一个List
+   * 2.将相同用户id的推荐信息合并为一个map
+   * 		(1).将两个推荐结果map先转化为list，然后合并到一起
+   * 		(2).对list集合按照类型进行分组
+   * 		(3).对分组后内容进行合并和去重
+   * 				这里，经过之前的分组，同一个用户的相同类型的推荐结果分到了一组，并组成一个list,所以这里就需要对同一类型的推荐结果组成的list进行处理
+   *				list2的数据格式是：Map[String, List[(String, List[(String, Double)])]]-->Map[类型, List[(类型, List[(被推荐物品的业务id, score)])]]
+   * 				1.对分组后的由相同类型推荐内容组成的list的数据进行合并，就是将同一种类型的推荐结果(list)合并为一个list
+   * 				2.因为合并后的内容是由多个可能存在重复id的被推荐物品组成的，所以这里需要对相同id的数据进行分数累加，并去重
+   * 3.将命名空间加入到结果中
+   * 4.将结果RDD转化为一个数组
+   */
+  def combineResult(
+    namespace: String,
+    recBasedFriends: RDD[(VertexId, Map[Long, List[(Long, Double)]])],
+    recBasedCircle: RDD[(VertexId, Map[Long, List[(Long, Double)]])]): RDD[(Int, VertexId, Map[Long, List[(Long, Double)]])] = {
+
+    //1.先将两个数组合到一起
+    val arr1 = recBasedFriends.++(recBasedCircle)
+    //2.将相同用户id的推荐信息(map)合并为一个map,
+    //返回结果是;RDD[(String, Map[String, List[(String, Double)]])]-->RDD[(命名空间，用户业务id, Map[推荐物品类型, List[(推荐物品业务id, Double)]])]
+    val recResult = arr1.reduceByKey((x, y) => mapCombine(x, y)).map(x => (0, x._1, x._2))
+
+    recBasedFriends.unpersist(blocking = false)
+    recBasedCircle.unpersist(blocking = false)
+    recResult
+  }
+
+  /**
+   * 参数代表同一个用户下的基于圈子的推荐信息和基于好友的推荐信息
+   * 	@param data1 Map[Long, List[(Long, Double)]]-->Map[type, List[(被推荐物品业务id, score)]]
+   *  @return Map[Long, List[(Long, Double)]]
+   * 将两个map进行合并，条件是相同的用户id，对list进行合并，并对合并后的list进行分数累加和去重
+   *
+   * 之所以开始会将Map转化为list，原因是，将两个map合并到一起的时候，相同的key会进行覆盖，但是我们不希望后边的将前边的覆盖掉，所以转化为list进行计算
+   */
+  def mapCombine(data1: Map[Long, List[(Long, Double)]], data2: Map[Long, List[(Long, Double)]]): Map[Long, List[(Long, Double)]] = {
+    //1.将两个推荐结果map先转化为list，然后合并到一起
+    val list1 = data1.toList.:::(data2.toList)
+    //2.对list集合按照类型进行分组   
+    val list2 = list1.groupBy(x => x._1)
+    //3.对分组后内容进行合并和去重
+    //这里，经过之前的分组，同一个用户的相同类型的推荐结果分到了一组，并组成一个list,所以这里就需要对同一类型的推荐结果组成的list进行处理
+    //list2的数据格式是：Map[String, List[(String, List[(String, Double)])]]-->Map[类型, List[(类型, List[(被推荐物品的业务id, score)])]]
+    val result = list2.map { x => //x:(String, List[(String, List[(String, Double)])])
+      //对分组后的由相同类型推荐内容组成的list的数据进行合并，就是将同一种类型的推荐结果(list)合并为一个list
+      //返回值：List[(String, Double)]，代表当前类型下的推荐结果组成的list
+      val comData = x._2.map(_._2).reduce((x, y) => x.++(y))
+      //因为合并后的内容是由多个可能存在重复id的被推荐物品组成的，所以这里需要对相同id的数据进行分数累加，并去重
+      val addScoreData = comData.groupBy(_._1).map(x => (x._1, x._2.map(_._2).reduce((x, y) => x + y))).toList.sortBy(x => x._2).takeRight(10)
+      (x._1, addScoreData)
+    }
+    val mmuMap: Map[Long, List[(Long, Double)]] = Map[Long, List[(Long, Double)]]()
+    mmuMap.++=(result)
+  }
+
+  /**
+   * 将推荐结果中的顶点类型和顶点id转化为对应的String类型的业务类型
+   */
+  def finallyResultHandle(result: RDD[(Int, Long, Map[Long, List[(Long, Double)]])]): RDD[(Int, String, Map[String, List[(String, Double)]])] = {
+    val pointIdMap = ReadData.pointIdMap
+    val pointTypeMap = ReadData.pointTypeMap
+    val pointAttrMap = ReadData.pointAttrMap
+
+    val handleResult = result.map { x =>
+      val recMap = x._3.map { mapInfo =>
+        val recType = pointTypeMap.apply(mapInfo._1)
+        val recList = mapInfo._2.map(x => (pointIdMap.apply(x._1), x._2))
+        (recType, recList)
+      }
+
+      (x._1, pointIdMap.apply(x._2), recMap)
+    }
+
+    handleResult
+  }
+}

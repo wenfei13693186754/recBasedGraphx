@@ -1,0 +1,16 @@
+package com.wdcloud.graphx.environmentContext
+
+import com.wdcloud.graphx.javaUtil.Configuration
+
+/**
+ * 推荐引擎运行的上下文
+ */
+trait DataContext extends Serializable{
+  
+  //定义上下文中的配置参数
+  var conf: Configuration
+  
+  //读取hbase时候，配置参数是从配置表中读取出来
+  var userConf: Map[String, String]
+  
+}

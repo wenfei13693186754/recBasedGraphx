@@ -1,0 +1,40 @@
+package com.wdcloud.graphx.unit
+
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+
+/**
+ * 将Map[String, List[(String, Double)]]数据结构转化为下边的json类型
+ * 			{"aa":[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]}
+ */
+class DataToJson extends Serializable{
+ /* def main(args: Array[String]): Unit = {
+    val json = mapToJson(Map[String, List[(String, Double)]]("aa" -> List(("item1", 3.0), ("item2", 4.0), ("item3", 2.0)),"ab" -> List(("item1", 3.0), ("item2", 4.0), ("item3", 2.0))))
+    println(json)
+  }*/
+  def listToJson(data: List[(String, Double)]): JSONArray = {
+      val jsonItems = new JSONArray
+      data.foreach { y => //(String, Double)
+        val jsonItem = new JSONArray
+        jsonItem.add(y._1)
+        jsonItem.add(y._2)//通过两次add后得到的json格式是：["item2",4]
+        jsonItems.add(jsonItem)//遍历完成后得到的数据结构是[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]
+    }
+    jsonItems
+  }
+
+   def mapToJson(data: Map[String, List[(String, Double)]]): JSONObject = {
+     val jsonObject = new JSONObject
+     data.foreach { y => //(String, List[(String, Double)])
+       val jsonItems = new JSONArray
+       y._2.foreach{x =>
+         val jsonItem = new JSONArray
+         jsonItem.add(x._1)
+         jsonItem.add(x._2)//通过两次add后得到的json格式是：["item2",4]
+         jsonItems.add(jsonItem)//遍历完成后得到的数据结构是[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]
+       }
+       jsonObject.put(y._1, jsonItems)
+     }
+   jsonObject
+  }
+}

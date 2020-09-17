@@ -1,0 +1,16 @@
+package com.wdcloud.graphx.kafka
+
+import org.apache.spark._
+import org.apache.spark.streaming.StreamingContext
+import org.apache.spark.streaming.Milliseconds
+
+/**
+ * kafka消费端
+ */
+object Consumer {
+  def main(args: Array[String]): Unit = {
+    val conf = new SparkConf().setAppName("kafka-cosumer").setMaster("local[*]")
+    val ssc = new StreamingContext(conf, Milliseconds(500))
+    val aa = 1
+  }
+}

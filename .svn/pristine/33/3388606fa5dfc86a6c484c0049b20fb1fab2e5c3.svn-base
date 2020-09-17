@@ -1,0 +1,14 @@
+package com.wdcloud.graphx.modelBuild.graph
+
+import com.wdcloud.graphx.javaUtil.Configuration
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Graph
+import com.wdcloud.graphx.environmentContext.DataContext
+
+trait GraphModel{  
+  
+  /*
+   * 创建图抽象方法
+   */
+  def createGraph(sc: SparkContext): Graph[Map[String, Object], Double]
+}

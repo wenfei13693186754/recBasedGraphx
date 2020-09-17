@@ -1,0 +1,33 @@
+package com.wdcloud.graphx.unit
+
+import org.apache.spark.rdd.RDD
+
+/*
+ * 计算user和一度好友之间的亲密度
+ * edgeData[(Long, Long, Int, Long)]
+ * 				srcId,dstId,communicateNum,time（time代表的是用户之间最近一次交互的时间和当前时间的时间差） 
+ * comAvg:用户之间的平均交互次数；
+ * 
+ * 返回值：RDD[(long,long,Double)]-->(srcId,dstId,score)
+ */
+object CountCohesion {
+  def countCohesion(edgeData: List[(Long, Long, Int, Long)], comAvg: Double): List[(Long, Long, Double)] = {
+    //计算亲密度
+    val cohesion = edgeData.map { x =>
+      var scoreCom: Double = 0
+      var totalScore: Double = 0
+      if (comAvg != 0) {
+        scoreCom = (x._3 - comAvg) * 0.6 / comAvg
+        //时间差的指数作为分母
+        totalScore = scoreCom / math.pow(x._4 / 3600000, 1.5)
+      } else {
+        totalScore = -1.0
+      }
+      (x._1, x._2, totalScore)
+    }
+
+    //cohesion.foreach { x => println(x._1+" 与 "+x._2+" 相似度是  "+x._3) }
+    cohesion
+  }
+
+}

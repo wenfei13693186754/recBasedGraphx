@@ -1,0 +1,45 @@
+package com.wdcloud.graphx.recommend
+
+import java.io.Serializable
+import com.wdcloud.graphx.unit.DataToJson
+import com.wdcloud.graphx.kafka.Producer
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.test.CreateSparkContext
+import org.apache.spark.SparkContext
+import java.io.PrintStream
+import java.io.FileOutputStream
+import java.io.File
+
+/**
+ * 使用recommend实现基于好友、圈子来实现推荐二度好友、com.wdcloud.graphx.圈子、物品
+ * 		要求：1.离线的、全量com.wdcloud.graphx.的；
+ * 				 2.各种关系基于不同权重进行推荐
+ * 
+ * jobserver调用
+ *
+ */    
+object RecBasedGraphx extends Serializable {  
+  val logger = Logger(this.getClass.getName)
+  
+  def startRec (
+      sc: SparkContext, 
+      namespace: String, 
+      edgeTable: String,
+      pAttrTable: String,
+      iAttrTable: String){   
+
+    //创建图
+    val graph = CreateGraph.createGraph(sc, namespace, edgeTable, pAttrTable, iAttrTable)
+    
+    //调用推荐算法进行推荐结果的计算    
+    val recResult = RecCode.recForUsers(graph, namespace)
+    
+    //将结果转化为json格式
+    val jsonResult = DataToJson.recResultRDDToJson(recResult)
+    
+    //将结果放到kafka中
+    val kafkaProducer = Producer.sendMsgToKafka(jsonResult, namespace)  
+    sys.exit()//退出应用
+  }  
+}
+

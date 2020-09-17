@@ -1,0 +1,12 @@
+package com.wdcloud.graphx.recommender
+
+import org.apache.spark.graphx.Graph
+import org.apache.spark.rdd.RDD
+import org.apache.spark.graphx.VertexId
+
+/**
+ * 推荐算法对象的公共接口
+ */
+trait Recommender {
+  def predict(graph: Graph[Map[String, Object], Double], namespace: String): RDD[(String, String, Map[String, List[(String, Double)]])]
+}

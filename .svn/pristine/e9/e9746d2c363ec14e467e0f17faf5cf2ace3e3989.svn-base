@@ -1,0 +1,67 @@
+package spark.client;
+
+import org.apache.commons.codec.binary.Base64;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.util.concurrent.ListenableFuture;
+import org.springframework.util.concurrent.ListenableFutureCallback;
+import org.springframework.web.client.AsyncRestTemplate;
+
+/**
+ * @author CHENYB
+ * @since 2016年10月18日
+ */
+public class SparkSpringRest {
+
+	String unitServerUrl = "http://192.168.6.152:8090/jobs?appName=recommend&classPath=com.wdcloud.graphx.jobServer.RecBasedGraphxServer";
+
+	/**
+	 * @author CHENYB
+	 * @param args
+	 * @since 2016年10月18日 下午6:21:40
+	 */
+	public static void main(String[] args) {
+		SparkSpringRest rest = new SparkSpringRest();
+		rest.invokSparkBySpringRestWithoutResult();
+	}
+
+	/**
+	 * @author CHENYB
+	 * @param serverUrl
+	 * @since 2016年10月19日 下午2:06:14
+	 */
+	public void invokSparkBySpringRestWithoutResult() {
+		AsyncRestTemplate asyncRestTemplate = new AsyncRestTemplate();
+		HttpHeaders headers = new HttpHeaders();
+		//MediaType
+		MediaType type = MediaType.parseMediaType("application/json; charset=UTF-8");
+		headers.setContentType(type);
+		headers.add("Accept", MediaType.APPLICATION_JSON.toString());
+		//Authorization
+		String plainCreds = "admin:admin";
+		byte[] plainCredsBytes = plainCreds.getBytes();
+		byte[] base64CredsBytes = Base64.encodeBase64(plainCredsBytes);
+		String base64Creds = new String(base64CredsBytes);
+		headers.add("Authorization", "Basic " + base64Creds);
+
+		HttpEntity<String> formEntity = new HttpEntity<String>(headers);
+		ListenableFuture<ResponseEntity<Void>> forEntity = asyncRestTemplate.postForEntity(unitServerUrl, formEntity, Void.class);
+		//异步调用后的回调函数
+		forEntity.addCallback(new ListenableFutureCallback<ResponseEntity<Void>>() {
+			//调用失败
+			@Override
+			public void onFailure(Throwable e) {
+				System.out.println("=====rest response faliure======");
+			}
+
+			//调用成功
+			@Override
+			public void onSuccess(ResponseEntity<Void> result) {
+				System.out.println("--->async rest response success----, result = " + result);
+			}
+		});
+	}
+
+}

@@ -1,0 +1,204 @@
+package com.wdcloud.graphx.hbase
+
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.HTable
+import org.apache.hadoop.hbase.client.Put
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+
+import akka.event.slf4j.Logger
+import scala.collection.immutable.Seq
+import org.apache.hadoop.hbase.client.Get
+import org.apache.hadoop.hbase.client.Scan
+import org.apache.spark.rdd.RDD
+import com.google.common.hash.Hashing
+import org.apache.spark.graphx.Edge
+
+/**
+ * spark-submit --name "SparkHbase" --master spark://192.168.6.83:7077 --class com.chen.spark.hbase.SparkHbase lib/SparkHbase.jar
+ */
+object SparkHbase {
+
+  val logger = Logger(this.getClass.getName)
+
+  val conf = new SparkConf().setAppName("SparkHbase").setMaster("local")
+  val sc = new SparkContext(conf)
+  val conf1 = HBaseConfiguration.create()
+  conf1.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+  conf1.set("hbase.zookeeper.property.clientPort", "2181");
+  /**
+   * main
+   */
+  def main(args: Array[String]): Unit = {
+    val t0 = System.currentTimeMillis()
+    read("RECEDGES_TESTDATA10")
+    val t1 = System.currentTimeMillis()
+    println("读取数据用时："+(t1-t0))
+    //write("UIC_TEST", System.currentTimeMillis() + "", "YH", "FRIENDS") 
+
+    //从hbase中读取各种数据
+    //readEdgesData("TESTSPACE:T_LOG_STATISTICS")
+    //readPersonAttrData("TESTSPACE:T_LOG_PERSON")
+    //readItemAttrData("TESTSPACE:T_LOG_ITEM", sc)
+  }
+
+  /**
+   * 读取边的信息
+   * 	表名：TESTSPACE:T_LOG_STATISTICS
+   */
+
+
+  /**
+   * read
+   */
+  def read(tableName: String): Unit = {
+
+    logger.warn("SparkContext complete")
+    logger.warn("Start RDD")
+    logger.warn("Start SparkContext")
+    conf1.set(TableInputFormat.INPUT_TABLE, tableName)
+    // Initialize hBase table if necessary,初始化hbase表
+    val admin = new HBaseAdmin(conf1)
+    if (admin.isTableAvailable(tableName)) {
+      val t0 = System.currentTimeMillis()
+      /*
+	     * newAPIHadoopRDD:从hbase中创建RDD
+	     * Get an RDD for a given Hadoop file with an arbitrary new API InputFormat and extra configuration options to pass to the input format. 
+        Parameters
+          conf
+          Configuration for setting up the dataset. Note: This will be put into a Broadcast. Therefore if you plan to reuse this conf to create multiple RDDs, you need to make sure you won't modify the conf. A safe approach is always creating a new conf for a new RDD.
+          fClass
+          Class of the InputFormat
+          kClass
+          Class of the keys
+          vClass
+          Class of the values
+	     * 
+	     */
+      val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+        classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+        classOf[org.apache.hadoop.hbase.client.Result])
+      val t1 = System.currentTimeMillis()
+      println("创建hbaseRDD用时：" + (t1 - t0))
+      logger.warn("RDD complete")
+      //统计数量
+      val count = hBaseRDD.count()
+      logger.warn("HBase RDD Count:" + count)
+
+      //遍历输出 
+      //hBaseRDD.foreach(println)
+      //hBaseRDD.cache()
+      val hbaseData = hBaseRDD.map {
+        case (_, result) =>
+          val tt = result.listCells().size()
+          val key = Bytes.toString(result.getRow)
+          val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes))
+          val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes))
+          //println("rowKey:" + key + " USERID:" + USERID + " CATEGORY:" + CATEGORY)
+      }.collect()
+    }
+    admin.close()
+  }
+
+  /**
+   * write
+   */
+  //def write(tableName: String, rowKey: String, familyName: String, columnName: String, sc: SparkContext): Unit = {
+  def write(tableName: String, rowKey: String, familyName: String, columnName: String): Unit = {
+    val table1 = new HTable(conf1, Bytes.toBytes("RECEDGES_TESTDATA8"));
+    val edgesData = sc.textFile("E:\\spark\\Spark-GraphX\\data\\writeToHbaseData\\relInGood8.edges").collect()
+    //edgesData中的数据格式是：person_4 person book_1 book 0 0 0 0 0 0 0 2016-09-06 11:08:08
+
+    //     * 将edgesData中的数据写入到hbase中
+    //     * 	表名是：TESTSPACE:T_LOG_STATISTICS
+    //     * 	列族是：INFO
+    //     *  行健：用户业务id_物品业务id
+    //     * 	列是：各个字段
+
+    table1.setAutoFlush(false) //开启缓存区
+    table1.setWriteBufferSize(100000)
+    var puts: List[Put] = List[Put]()
+    var num = 0
+    edgesData.foreach { x => //person_4 person book_1 book 0 0 0 0 0 0 0 2016-09-06 11:08:08
+      val arr = x.split(" ")
+      val put = new Put((arr(0) + "_" + arr(2)).getBytes()); //为指定行创建一个Put操作
+      put.addColumn("INFO".getBytes(), "ACCOUNT".getBytes(), Bytes.toBytes("g1")); //写入命名空间
+      put.addColumn("INFO".getBytes(), "USER_ID".getBytes(), Bytes.toBytes(arr(0))); //写入用户业务id
+      put.addColumn("INFO".getBytes(), "ITEM_ID".getBytes(), Bytes.toBytes(arr(2))); //写入用户关系的物品(好友、圈子、物品)业务id
+      put.addColumn("INFO".getBytes(), "CATEGORY".getBytes(), Bytes.toBytes(arr(3))); //写入物品类别
+      put.addColumn("INFO".getBytes(), "LAST_TIME".getBytes(), Bytes.toBytes(arr(11))); //写入时间戳
+      put.addColumn("INFO".getBytes(), "INFO.SHARE".getBytes(), Bytes.toBytes("1")); //交互：分享次数
+      put.addColumn("INFO".getBytes(), "INFO.COMMENT".getBytes(), Bytes.toBytes("1")); //相同属性
+      put.addColumn("INFO".getBytes(), "INFO.REPLY".getBytes(), Bytes.toBytes("3")); //回复的次数
+      //put.addColumn(familyName.getBytes(), Bytes.toBytes(columnName + "_"), Bytes.toBytes(value.mkString(",")));
+      //puts = puts.:+(put)
+      num = num + 1
+      println("数据量：" + num)
+      table1.put(put)
+    }
+    table1.close()
+    println("写入边数据结束")
+    val table2 = new HTable(conf1, Bytes.toBytes("RECPATTR_TESTDATA7"));
+    table2.setAutoFlush(false, true)
+    table2.setWriteBufferSize(100000)
+    val vertexOfPerson = sc.textFile("E:\\spark\\Spark-GraphX\\data\\writeToHbaseData\\relInGoodPerson7.attr").collect()
+    /*
+     * 将vertex数据写入到hbase
+     * 	其中数据格式是：person_1 person girl 25 beijing rose 1 3
+     * 	
+     * 	表名是：TESTSPACE:T_LOG_PERSON
+     * 	列族是：INFO
+     *  行健是：用户业务id
+     *  列是：各个字段
+     */
+    var num1 = 0
+    vertexOfPerson.foreach { x =>
+      val arr = x.split(" ")
+      val put = new Put((arr(0)).getBytes()); //为指定行创建一个Put操作
+      put.addColumn("INFO".getBytes(), "CATEGORY".getBytes(), Bytes.toBytes(arr(1)));
+      put.addColumn("INFO".getBytes(), "USER_ID".getBytes(), Bytes.toBytes(arr(0)));
+      table2.put(put);
+      num1 = num1 + 1
+      println("写入person表数据量：" + num1)
+    }
+    table2.flushCommits()
+    table2.close();
+    println("用户表写入完成********************************")
+    Thread.sleep(5000)
+
+    val table3 = new HTable(conf1, Bytes.toBytes("RECIATTR_TESTDATA7"));
+    table3.setAutoFlush(false, true)
+    table3.setWriteBufferSize(100000)
+    val vertexOfItem = sc.textFile("E:\\spark\\Spark-GraphX\\data\\writeToHbaseData\\relInGoodItem7.attr").collect()
+    /*
+     * 将vertex数据写入到hbase   
+     * 	其中数据格式是：circle_2 circle friends 10 beijing play 1 3
+     * 	
+     * 	表名是：TESTSPACE:T_LOG_ITEM
+     * 	列族是：INFO
+     *  行健是：物品类型_物品业务id
+     *  列是：各个字段
+     */
+    var num2 = 0
+    vertexOfItem.foreach { x =>
+      val arr = x.split(" ")
+      val put = new Put((arr(1) + "_" + arr(0)).getBytes()); //为指定行创建一个Put操作
+      put.addColumn("INFO".getBytes(), "CATEGORY".getBytes, Bytes.toBytes(arr(1)));
+      put.addColumn("INFO".getBytes(), "ITEM_ID".getBytes, Bytes.toBytes(arr(0)));
+      table3.put(put);
+      num2 = num2 + 1
+      println("写入物品表的数据量：" + num2)
+    }
+    table3.flushCommits()
+    table3.close();
+    println("写入物品表完成+++++++++++++++++++++++++++++++++++++++++++++++++++++")
+  }
+  
+
+  
+}

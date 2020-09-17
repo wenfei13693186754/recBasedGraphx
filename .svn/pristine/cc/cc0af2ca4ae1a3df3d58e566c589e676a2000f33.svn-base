@@ -1,0 +1,75 @@
+package com.wdcloud.graphx.graphOperate
+
+import java.io.Serializable
+
+import scala.Iterator
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.EdgeTriplet
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import org.apache.spark.graphx.TripletFields
+import org.apache.spark.graphx.VertexId
+import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.unit.DataToJson
+import com.wdcloud.graphx.kafka.Producer
+import com.wdcloud.graphx.hbase.SparkHbase
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.HTable
+import org.apache.hadoop.hbase.client.Put
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+
+ import akka.event.slf4j.Logger
+import scala.collection.immutable.Seq
+import org.apache.hadoop.hbase.client.Get
+import org.apache.hadoop.hbase.client.Scan
+import org.apache.spark.storage.StorageLevel
+
+object CreateGraph extends Serializable{
+  /*   
+   * 创建图  
+   * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的aply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+   * Double是Edge上的属性的类型  
+   */
+  //def createGraph(namespace: String): Graph[Map[String, Object], Double] = {
+  def createGraph(sc: SparkContext, edgeTable: String, perTable: String, iterTable: String): Graph[Map[String, Object], Double] = {
+    val logger = Logger(this.getClass.getName)
+    //创建readData对象，用来调用其身上的方法创建出边RDD和顶点RDD
+    val readData = new ReadData(sc)
+    //val edges = readData.readEdgesData(namespace+":T_LOG_STATISTICS")
+    //创建边RDD
+    val edges = readData.readEdgesData(edgeTable)
+    logger.warn("边edges RDD创建好了")
+    //val vertex = readData.readPersonAttrData(namespace+":T_LOG_PERSON").++(readData.readItemAttrData(namespace+":T_LOG_ITEM"))
+    //创建顶点RDD
+    val vertex = readData.readPersonAttrData(perTable).++(readData.readItemAttrData(iterTable))
+    logger.warn("顶点vertex RDD创建好了")
+    //利用 fromEdges建立图          
+    //创建中间图，并缓存
+    val graph = Graph(vertex, edges).cache
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val finallyGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost)).cache()
+    
+    //将中间图释放掉
+    graph.edges.unpersist(blocking = false)
+    graph.unpersistVertices(blocking = false)
+    
+    //将顶点和边RDD释放掉
+    edges.unpersist(blocking = false)
+    vertex.unpersist(blocking = false)
+    dealGraph.unpersist(blocking = false)
+    
+    finallyGraph
+  }
+}

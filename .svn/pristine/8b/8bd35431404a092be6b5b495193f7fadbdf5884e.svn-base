@@ -1,0 +1,57 @@
+package com.wdcloud.graphx.recommend
+
+import java.io.Serializable
+
+import scala.Iterator
+import org.apache.spark._
+import org.apache.spark.graphx._
+import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.kafka.Producer
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+
+ import akka.event.slf4j.Logger
+import scala.collection.immutable.Seq
+import org.apache.spark.storage.StorageLevel
+import com.wdcloud.graphx.recommend.ReadData
+
+object CreateGraph extends Serializable{
+  /*   
+   * 创建图  
+   * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的aply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+   * Double是Edge上的属性的类型  
+   */
+  def createGraph(sc: SparkContext, namespace: String, edgeTable: String, pAttrTable: String, iAttrTable: String): Graph[Map[String, Object], Double] = {
+    val logger = Logger(this.getClass.getName)
+    val t0 = System.currentTimeMillis()
+    //创建边RDD
+    val edges = ReadData.readEdgesData(sc, s"${namespace}:${edgeTable}")  
+    val t1 = System.currentTimeMillis()
+    logger.warn("边edges RDD创建好了,用时："+(t1-t0))
+    
+    //创建顶点RDD
+    val vertex = ReadData.readPersonAttrData(sc, s"${namespace}:${pAttrTable}").++(ReadData.readItemAttrData(sc, s"${namespace}:${iAttrTable}"))
+    val t2 = System.currentTimeMillis()
+    logger.warn("顶点vertex RDD创建好了,用时："+(t1-t0))
+    
+    //利用 fromEdges建立图          
+    //创建中间图，并缓存
+    val graph = Graph(vertex, edges).groupEdges((x, y) => x+y)
+    
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)
+    
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val fGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost))
+    //合并边，调用groupEdges时要先调用partitionBy
+    val ffGraph = fGraph.partitionBy(PartitionStrategy.EdgePartition1D,10).groupEdges(merge = (e1, e2) => (e1 + e2))
+    ffGraph
+    
+  }
+}

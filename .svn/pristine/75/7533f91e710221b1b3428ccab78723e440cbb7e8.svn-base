@@ -1,0 +1,65 @@
+package com.wdcloud.graphx.unit
+
+import com.alibaba.fastjson.JSONArray
+import com.alibaba.fastjson.JSONObject
+import org.apache.spark.rdd.RDD
+import akka.event.slf4j.Logger
+
+/**
+ * 将Map[String, List[(String, Double)]]数据结构转化为下边的json类型
+ * 			{"aa":[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]}
+ */
+object DataToJson extends Serializable{
+  
+  val logger = Logger(this.getClass.getName) 
+  
+  def listToJson(data: List[(String, Double)]): JSONArray = {
+      val jsonItems = new JSONArray
+      data.foreach { y => //(String, Double)
+        val jsonItem = new JSONArray
+        jsonItem.add(y._1)
+        jsonItem.add(y._2)//通过两次add后得到的json格式是：["item2",4]
+        jsonItems.add(jsonItem)//遍历完成后得到的数据结构是[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]
+    }
+    jsonItems
+  }
+
+   def mapToJson(data: Map[String, List[(String, Double)]]): JSONObject = {
+     val jsonObject = new JSONObject
+     data.foreach { y => //(String, List[(String, Double)])
+       val jsonItems = new JSONArray
+       y._2.foreach{x =>
+         val jsonItem = new JSONArray
+         jsonItem.add(x._1)
+         jsonItem.add(x._2)//通过两次add后得到的json格式是：["item2",4]
+         jsonItems.add(jsonItem)//遍历完成后得到的数据结构是[["item1",3],["item2",4],["item3",2]],"ab":[["item1",3],["item2",4],["item3",2]]
+       }
+       jsonObject.put(y._1, jsonItems)
+     }
+   jsonObject
+  }
+   
+  /**
+   * 将推荐结果中的对每个用户的推荐结果组成的Map中的list转化为json格式
+   * 数据格式：Array[(String, String, JSONObject)]-->Array[(表名, 用户业务id, JSONObject)]
+   */
+  def recResultRDDToJson(
+      recResult: RDD[(String, String, Map[String, List[(String, Double)]])]):
+      RDD[(String, String, JSONObject)] = 
+      {
+    
+    val jsonResult = recResult.map(x => (x._1, x._2, mapToJson(x._3)))
+    jsonResult
+  }
+}
+
+
+
+
+
+
+
+
+
+
+

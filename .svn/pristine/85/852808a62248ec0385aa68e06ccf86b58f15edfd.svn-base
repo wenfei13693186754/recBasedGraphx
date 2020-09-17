@@ -1,0 +1,83 @@
+package com.wdcloud.graphx.test
+
+import java.io.Serializable
+
+import com.wdcloud.graphx.recommend.RecCode
+import com.wdcloud.graphx.kafka.Producer
+import com.wdcloud.graphx.unit.DataToJson
+import com.wdcloud.graphx.unit.PregelUtil
+
+import akka.event.slf4j.Logger
+import java.io.PrintStream
+import java.io.FileOutputStream
+import java.io.File
+
+/**
+ * 使用spark-graphx实现基于好友、圈子来实现推荐二度好友、圈子、物品
+ * 		要求：1.离线的、全量的；
+ * 				 2.各种关系基于不同权重进行推荐
+ * 
+ * 本地测试类
+ *
+ */
+object RecBasedGraphxTest extends Serializable {
+  
+  val logger = Logger(this.getClass.getName)
+  
+  def main(args: Array[String]): Unit = {
+    
+    @transient val sc = CreateSparkContext.init()
+    
+    val t1 = System.currentTimeMillis()  
+    //main方法调用
+    //val graph = CreateGraphTest.createGraph(sc, args(0), args(1), args(2))
+    
+    //eclipse调用，调错使用
+    val graph = CreateGraphxBasedText.createGraph()
+    //多变合并
+    val newGraph = graph.groupEdges((x, y) => x + y)
+    val t2 = System.currentTimeMillis()  
+    logger.warn("创建图用时：" + (t2 - t1))  
+    
+    //******************************推荐*****************************************    
+    //基于好友的推荐，包括推荐好友、物品和圈子，返回值类型是;RDD[(String, String, Map[String, List[(String, Double)]])]
+    val recBasedFriends = RecCode.recBasedSimUser(newGraph)  
+    val t3 = System.currentTimeMillis()  
+    logger.warn("基于好友推荐用时：" + (t3 - t2))
+    
+    //迭代结束后将PregelUtil重新赋值为0，为基于圈子的迭代做准备
+    PregelUtil.iterNum = 0
+    
+    //离线的对每个用户基于圈子进行物品、好友和圈子的推荐,返回值是RDD[(String, String, Map[String, List[(String, Double)]])]
+    val recBasedCircle = RecCode.recICUForUserBasedCircle(newGraph)
+    val t4 = System.currentTimeMillis()  
+    logger.warn("基于圈子推荐用时：" + (t4 - t3))
+    
+    //对两种推荐结果进行合并   INFO.LOGINID:112233xyf;
+    val recResult = RecCode.combineResult(newGraph, "g1", recBasedFriends, recBasedCircle)
+    val fs = new FileOutputStream(
+		new File("E:\\spark\\Spark-GraphX\\data\\推荐结果准确性测试\\newResult.txt"));
+		val p = new PrintStream(fs);
+		//
+		recResult.collect().foreach(x => p.println("命名空间 "+x._1+" 下 "+x._2+"的推荐结果是："+x._3.mkString(",")))
+    val t5 = System.currentTimeMillis()
+    logger.warn("合并推荐结果用时：" + (t5 - t4))
+    
+    //********************************将结果转化为json格式******************************************
+    //将推荐结果中的对每个用户的推荐结果组成的Map中的list转化为json格式
+    //数据格式：Array[(String, String, JSONObject)]-->Array[(表名, 用户业务id, JSONObject)]
+    val jsonResult = recResult.map(x => (x._1, x._2, DataToJson.mapToJson(x._3)))
+    val t6 = System.currentTimeMillis()
+    logger.warn("将推荐结果转化为json用时：" + (t6 - t5))
+    
+    //********************************将结果放到kafka中*********************************************
+    val kafkaProducer = Producer  
+    jsonResult.foreach { x =>
+      //kafkaProducer.sends("OCTOBER"+".T_REC_RESULT", x._2, x._3.toString())
+    }
+    val t7 = System.currentTimeMillis()
+    logger.warn("将消息放到kafka中用时：" + (t7 - t1))
+    sys.exit()//退出应用
+   }  
+}
+

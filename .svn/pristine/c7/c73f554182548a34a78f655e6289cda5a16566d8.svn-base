@@ -1,0 +1,34 @@
+package com.wdcloud.graphx.recommender.graph
+
+import org.apache.spark.rdd.RDD
+import com.wdcloud.graphx.scalaUtil.HbaseUtil
+import com.wdcloud.graphx.recommender.graph.util.GraphResultHandle
+import akka.event.slf4j.Logger
+import org.apache.spark.graphx.Graph
+
+class CompositeRecForAllUserRecommenders(graph1: Graph[Map[String, Object], Double], namespace: String) extends Serializable  {
+
+  val logger = Logger(this.getClass.getName) 
+  
+  def recForUsers(): RDD[(String, String, Map[String, List[(String, Double)]])] = {
+    val graph = graph1.cache()
+    //基于好友的推荐，包括推荐好友、物品和圈子，返回值类型是：
+    //RDD[(VertexId, (String, Map[String, List[(String, Double)]]))]-->RDD[(用户id，(用户业务id, Map[推荐物品类型, List[(推荐物品业务id, Double)]]))]
+    val recBasedFriends = TwoDegreesFriendsRecommender.predict(graph)
+    
+    HbaseUtil.writeRecInfoBasedUer(namespace, "T_REC_BASEDUSER", recBasedFriends.collect())
+    logger.warn("基于好友推荐完成")
+    //离线的对每个用户基于圈子进行物品、好友和圈子的推荐,返回值是RDD[(String, String, Map[String, List[(String, Double)]])]
+    val recBasedCircle = MixCommunityRecommender.predict(graph)
+    HbaseUtil.writeRecInfoBasedCircle(namespace, "T_REC_BASEDCIRCLE", recBasedCircle.collect())
+    logger.warn("基于圈子推荐完成")
+    //对两种推荐结果进行合并   INFO.LOGINID:112233xyf;
+    val comResult = GraphResultHandle.combineResult(graph, namespace, recBasedFriends, recBasedCircle)
+
+    logger.warn("开始释放缓存的图和基于好友和基于圈子的推荐结果")
+    graph.unpersistVertices(blocking = false)
+    graph.edges.unpersist(blocking = false)
+
+    comResult
+  }
+}

@@ -1,0 +1,24 @@
+package com.wdcloud.graphx.unit
+
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import spark.client.SparkSpringRest
+import collection.JavaConverters._
+
+object SubGraphTest {
+  def main(args: Array[String]): Unit = {
+    val conf = new SparkConf().setAppName("SparkHbase").setMaster("local")
+    val sc = new SparkContext(conf)
+    
+    val subData = sc.textFile("E:\\spark\\Spark-GraphX\\data\\subGraphData.txt").map { 
+      x => x.split(",").toList
+     
+    }
+    
+    subData.foreach {   
+      x => 
+        val rest = new SparkSpringRest();
+		    rest.invokSparkBySpringRestWithoutResult(x.asJava);    
+    }
+  }
+}

@@ -1,0 +1,571 @@
+/**
+ * Copyright (C) 2016 LibRec
+ * <p>
+ * This file is part of LibRec.
+ * LibRec is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * <p>
+ * LibRec is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ * <p>
+ * You should have received a copy of the GNU General Public License
+ * along with LibRec. If not, see <http://www.gnu.org/licenses/>.
+ */
+package com.wdcloud.graphx.javaUtil;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.Serializable;
+import java.net.JarURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+public class Configuration implements Iterable<Map.Entry<String, String>>,
+		Serializable {
+	/*
+	 * LogFactory Factory for creating Log instances, with discovery and
+	 * configuration features similar to that employed by standard Java APIs
+	 * such as JAXP(具有与标准Java API（如JAXP）类似的发现和配置功能。).
+	 * 
+	 * LogFactory.getLog(Configuration.class): 一个方便的方法返回一个命名的记录器，而不需要应用程序关心工厂。
+	 */
+	private static final Log LOG = LogFactory.getLog(Configuration.class);
+
+	private static final ConcurrentMap<ClassLoader, Map<String, Class<?>>> CACHE_CLASSES = new ConcurrentHashMap<ClassLoader, Map<String, Class<?>>>();
+	private Properties properties;
+
+	private ClassLoader classLoader;
+
+	{
+		/*
+		 * Thread.currentThread().getContextClassLoader()：
+		 * 返回此Thread的上下文ClassLoader。 上下文ClassLoader由线程的创建者提供，供在当前线程所运行的代码在加载类
+		 * 和资源时使用。 如果没有设置，默认值为父Thread的ClassLoader上下文。 原始线程的上下文ClassLoader通常
+		 * 设置为用于加载应用程序的类加载器。
+		 */
+		classLoader = Thread.currentThread().getContextClassLoader();
+		if (classLoader == null) {
+			// 返回类的类加载器。 一些实现或许使用null来表示bootstrap类加载器。
+			// 如果此类由bootstrap类加载器加载，此方法将在此类实现中将返回null。
+			classLoader = Configuration.class.getClassLoader();
+		}
+	}
+
+	// loadDefaults = true,代表需要加载一些默认的文件信息，比如librec.properties配置文件中的配置信息
+	private boolean loadDefaults = true;
+	/**
+	 * List of configuration resources.
+	 */
+	private ArrayList<Resource> resources = new ArrayList<Resource>();
+
+	private static final CopyOnWriteArrayList<String> defaultResources = new CopyOnWriteArrayList<String>();
+
+//	static {
+//		ClassLoader cL = Thread.currentThread().getContextClassLoader();
+//		if (cL == null) {
+//			cL = Configuration.class.getClassLoader();
+//		}
+//		if (cL.getResource("drivers.properties") != null) {
+//			LOG.warn("DEPRECATED: librec.properties found in the classpath. ");
+//		}
+//		// if (cL.getResource("driver.classes.props") != null) {
+//		// LOG.warn("DEPRECATED: driver.classes.props found in the classpath.
+//		// ");
+//		// }
+//		addDefaultResource("drivers.properties");
+//		// addDefaultResource("driver.classes.props");
+//	}
+
+	public static class Resource {
+		private final Object resource;
+		private final String name;
+
+		public Resource(Object resource) {
+			this(resource, resource.toString());
+		}
+
+		public Resource(Object resource, String name) {
+			this.resource = resource;
+			this.name = name;
+		}
+
+		public String getName() {
+			return name;
+		}
+
+		public Object getResource() {
+			return resource;
+		}
+
+		@Override
+		public String toString() {
+			return name;
+		}
+	}
+
+	/**
+	 * Add a default resource. Resources are loaded in the order of the
+	 * resources added. 添加默认资源。 资源按照添加的资源的顺序加载
+	 *
+	 * @param name
+	 *            file name. File should be present in the classpath.
+	 */
+	public static void addDefaultResource(String name) {
+		synchronized (Configuration.class) {
+			if (defaultResources.contains(name)) {
+				return;
+			}
+			defaultResources.add(name);
+		}
+	}
+
+	/**
+	 * Get an {@link Iterator} to go through the list of <code>String</code>
+	 * key-value pairs in the configuration.
+	 * 获取一个用来浏览configuration中key-value形式配置信息的迭代器
+	 *
+	 * @return an iterator over the entries.
+	 */
+	public Iterator<Entry<String, String>> iterator() {
+		Map<String, String> result = new HashMap<String, String>();
+		for (Map.Entry<Object, Object> item : getProps().entrySet()) {
+			if (item.getKey() instanceof String
+					&& item.getValue() instanceof String) {
+				result.put((String) item.getKey(), (String) item.getValue());
+			}
+		}
+		return result.entrySet().iterator();
+	}
+
+	/*
+	 * 将librec.properties和userknn-test.properties配置文件加载到内存
+	 */
+	public synchronized void addResource(Resource resource) {
+		resources.add(resource);// 将配置文件路径放到resurces数组中
+		loadResources(getProps(), resources);// 将配置信息加载到内存中
+	}
+
+	// 用新的配置信息覆盖掉旧的配置信息
+	private void overlay(Properties to, Properties from) {
+		for (Entry<Object, Object> entry : from.entrySet()) {
+			to.put(entry.getKey(), entry.getValue());
+		}
+	}
+
+	/**
+	 * Set the <code>value</code> of the <code>name</code> property.
+	 *
+	 * @param name
+	 *            property name.
+	 * @param value
+	 *            property value.
+	 */
+	public void set(String name, String value) {
+		getProps().setProperty(name, value);
+	}
+
+	public String get(String name) {
+		return getProps().getProperty(name);
+	}
+
+	/**
+	 * Set the array of string values for the <code>name</code> property as as
+	 * comma delimited values.
+	 *
+	 * @param name
+	 *            property name.
+	 * @param values
+	 *            The values
+	 */
+	public void setStrings(String name, String... values) {
+		set(name, StringUtil.arrayToString(values));
+	}
+
+	/**
+	 * Get the comma delimited values of the <code>name</code> property as an
+	 * array of <code>String</code>s. If no such property is specified then
+	 * <code>null</code> is returned.
+	 *
+	 * @param name
+	 *            property name.
+	 * @return property value as an array of <code>String</code>s, or
+	 *         <code>null</code>.
+	 */
+	public String[] getStrings(String name) {
+		String valueString = get(name);
+		return StringUtil.getStrings(valueString);
+	}
+
+	public Float getFloat(String name, Float defaultValue) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Float.valueOf(value);
+		} else {
+			return defaultValue;
+		}
+	}
+
+	/**
+	 * Set the value of the <code>name</code> property to a <code>float</code>.
+	 *
+	 * @param name
+	 *            property name.
+	 * @param value
+	 *            property value.
+	 */
+	public void setFloat(String name, float value) {
+		set(name, Float.toString(value));
+	}
+
+	public Float getFloat(String name) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Float.valueOf(value);
+		} else {
+			return null;
+		}
+	}
+
+	/**
+	 * Set the value of the <code>name</code> property to a <code>double</code>.
+	 *
+	 * @param name
+	 *            property name.
+	 * @param value
+	 *            property value.
+	 */
+	public void setDouble(String name, double value) {
+		set(name, Double.toString(value));
+	}
+
+	public Double getDouble(String name, Double defaultValue) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Double.valueOf(value);
+		} else {
+			return defaultValue;
+		}
+	}
+
+	public Double getDouble(String name) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Double.valueOf(value);
+		} else {
+			return null;
+		}
+	}
+
+	/**
+	 * 如果value不为空，那么返回value值，否则返回后边的默认值
+	 */
+	public String get(String name, String defaultValue) {
+		String value = get(name);
+		return StringUtils.isNotBlank(value) ? value : defaultValue;
+	}
+
+	/**
+	 * Set the value of the <code>name</code> property to an <code>long</code>.
+	 *
+	 * @param name
+	 *            property name.
+	 * @param value
+	 *            <code>int</code> value of the property.
+	 */
+	public void setLong(String name, long value) {
+		set(name, Long.toString(value));
+	}
+
+	public Long getLong(String name, Long defaultValue) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Long.valueOf(value);
+		} else {
+			return defaultValue;
+		}
+	}
+
+	public Long getLong(String name) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Long.valueOf(value);
+		} else {
+			return null;
+		}
+	}
+
+	/**
+	 * Set the value of the <code>name</code> property to an <code>int</code>.
+	 *
+	 * @param name
+	 *            property name.
+	 * @param value
+	 *            <code>int</code> value of the property.
+	 */
+	public void setInt(String name, int value) {
+		set(name, Integer.toString(value));
+	}
+
+	public Integer getInt(String name, Integer defaultValue) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Integer.valueOf(value);
+		} else {
+			return defaultValue;
+		}
+	}
+
+	public Integer getInt(String name) {
+		String value = get(name);
+		if (StringUtils.isNotBlank(value)) {
+			return Integer.valueOf(value);
+		} else {
+			return null;
+		}
+	}
+
+	/**
+	 * Set the array of int values for the <code>name</code> property as as
+	 * comma delimited values.
+	 *
+	 * @param name
+	 *            property name.
+	 * @param values
+	 *            The values
+	 */
+	public void setInts(String name, int[] values) {
+		set(name, StringUtil.arrayToString(values));
+	}
+
+	/**
+	 * Get the value of the <code>name</code> property as a set of
+	 * comma-delimited <code>int</code> values.
+	 * <p>
+	 * If no such property exists, an empty array is returned.
+	 *
+	 * @param name
+	 *            property name
+	 * @return property value interpreted as an array of comma-delimited
+	 *         <code>int</code> values
+	 */
+	public int[] getInts(String name) {
+		String[] strings = getTrimmedStrings(name);
+		int[] ints = new int[strings.length];
+		for (int i = 0; i < strings.length; i++) {
+			ints[i] = Integer.parseInt(strings[i]);
+		}
+		return ints;
+	}
+
+	/**
+	 * Get the comma delimited values of the <code>name</code> property as an
+	 * array of <code>String</code>s, trimmed of the leading and trailing
+	 * whitespace. If no such property is specified then an empty array is
+	 * returned.
+	 *
+	 * @param name
+	 *            property name.
+	 * @return property value as an array of trimmed <code>String</code>s, or
+	 *         empty array.
+	 */
+	public String[] getTrimmedStrings(String name) {
+		String valueString = get(name);
+		return StringUtil.getTrimmedStrings(valueString);
+	}
+
+	/**
+	 * Set the value of the <code>name</code> property to a <code>boolean</code>
+	 * .
+	 *
+	 * @param name
+	 *            property name.
+	 * @param value
+	 *            <code>boolean</code> value of the property.
+	 */
+	public void setBoolean(String name, boolean value) {
+		set(name, Boolean.toString(value));
+	}
+
+	public boolean getBoolean(String name) {
+		String value = get(name);
+		return StringUtils.isNotBlank(value) ? Boolean.valueOf(value) : false;
+	}
+
+	/*
+	 * 检查name对应的value值是否存在，如果name对应value值为null,""或者" ",那么返回defaultValue,
+	 * 否则返回value对应的布尔值
+	 */
+	public boolean getBoolean(String name, boolean defaultValue) {
+		String value = get(name);// 从配置文件中读取k 是name的value值
+		if (StringUtils.isNotBlank(value)) {// 检查value值,如果非null,非""，非" "，那么返回true,否则返回false
+			return Boolean.valueOf(value);// 返回由指定字符串表示的值的布尔值，如果返回的参数不是null并且不为空(""和" ")那么值为true,对于字符串"true",忽略大小写
+		} else {
+			return defaultValue;
+		}
+	}
+
+	private synchronized Properties getProps() {
+		if (properties == null) {
+			properties = new Properties();
+		}
+		return properties;
+	}
+
+	private void loadResources(Properties properties,
+			ArrayList<Resource> resources) {
+		// loadDefaluts值为true,开始加载默认信息源的信息，比如放到defaultResources中的librec.properties配置文件中的配置信息
+		if (loadDefaults) {
+			for (String resource : defaultResources) {
+				loadProperty(properties, new Resource(resource));
+			}
+		}
+		for (Resource resource : resources) {
+			loadProperty(properties, resource);
+		}
+	}
+
+	/*
+	 * 根据不同的文件路径格式，进入不同的判断语句中，然后生成对应的字节输入流fis，接着调用properties.load(fis)
+	 * 方法将配置文件的信息读取到内存中
+	 */
+	private void loadProperty(Properties properties, Resource wrapper) {
+		Object resource = wrapper.getResource();// 获取配置文件对应路径对象
+		try {
+			InputStream fis;
+			if (resource instanceof URL) { // an URL resource
+				fis = ((URL) resource).openStream();
+				properties.load(fis);
+			} else if (resource instanceof String) { // a CLASSPATH
+														// resource,明显我们在配置文件中配置的文件路径是String类型的
+				URL url = getResource((String) resource);// rec/cf/itemknn-test.properties---》file:/D:/workplace-scala/librec/core/target/classes/rec/cf/itemknn-test.properties
+				if (url != null) {
+					URLConnection connection = url.openConnection();// 返回一个URLConnection实例，该实例表示与URL引用的远程对象的连接。
+					if (connection instanceof JarURLConnection) {// JarURLConnection:
+																	// A URL
+																	// Connection
+																	// to a Java
+																	// ARchive
+																	// (JAR)
+																	// file or
+																	// an entry
+																	// in a JAR
+																	// file.
+						// Disable caching for JarURLConnection to avoid sharing
+						// JarFile
+						// with other users.
+						connection.setUseCaches(false);
+					}
+					fis = connection.getInputStream();
+					properties.load(fis);
+				}
+			} else if (resource instanceof Path) { // a file resource
+				fis = new FileInputStream(new File(((Path) resource).toUri()
+						.getPath()));
+				properties.load(fis);
+			} else if (resource instanceof InputStream) {
+				fis = (InputStream) resource;
+				properties.load(fis);
+			} else if (resource instanceof Properties) {
+				overlay(properties, (Properties) resource);
+			}
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * 根据文件名，返回文件的全路径名
+	 * 
+	 * @param name
+	 * @return
+	 */
+	public URL getResource(String name) {
+		return classLoader.getResource(name);
+	}
+
+	/**
+	 * Load a class by name.
+	 *
+	 * @param name
+	 *            the class name.
+	 * @return the class object.
+	 * @throws ClassNotFoundException
+	 *             if the class is not found.
+	 */
+	public Class<?> getClassByName(String name) throws ClassNotFoundException {
+		Map<String, Class<?>> map = CACHE_CLASSES.get(classLoader);
+		if (map == null) {
+			Map<String, Class<?>> newMap = new ConcurrentHashMap<String, Class<?>>();
+			map = CACHE_CLASSES.putIfAbsent(classLoader, newMap);
+			if (map == null) {
+				map = newMap;
+			}
+		}
+		Class<?> clazz = map.get(name);
+		if (clazz == null) {
+			clazz = Class.forName(name, true, classLoader);
+			if (clazz != null) {
+				map.put(name, clazz);
+			}
+		}
+
+		return clazz;
+	}
+
+	/**
+	 * Load a class by name.
+	 *
+	 * @param name
+	 *            the class name.
+	 * @param defaultName
+	 *            the default class.
+	 * @return the class object.
+	 * @throws ClassNotFoundException
+	 *             if the class is not found.
+	 */
+	public Class<?> getClassByName(String name, String defaultName)
+			throws ClassNotFoundException {
+		try {
+			return getClassByName(name);
+		} catch (ClassNotFoundException e) {
+			LOG.error(e);
+			return getClassByName(defaultName);
+		}
+	}
+
+	/**
+	 * 将conf转化为map对象
+	 * @param conf
+	 * @return
+	 */
+	public Map<String, String> toMap(Configuration conf) {    
+		Map<String, String> map = new HashMap<String, String>();
+		Iterator<Entry<String, String>> iter = conf.iterator();
+		while (iter.hasNext()) {
+			Entry<String, String> item = iter.next();
+			map.put(item.getKey(), item.getValue());
+		}
+		return map;
+	}
+
+}

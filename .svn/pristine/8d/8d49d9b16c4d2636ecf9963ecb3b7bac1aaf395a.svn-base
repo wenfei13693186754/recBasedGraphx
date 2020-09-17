@@ -1,0 +1,53 @@
+package com.wdcloud.graphx.jobServer
+
+import scala.util.Try
+import org.apache.spark.SparkContext
+import com.typesafe.config.Config
+import spark.jobserver.SparkJob
+import spark.jobserver.SparkJobInvalid
+import spark.jobserver.SparkJobValid
+import spark.jobserver.SparkJobValidation
+import spark.jobserver.NamedRddSupport
+import com.wdcloud.graphx.recommend.RecEng
+import collection.JavaConverters._
+import org.apache.spark.graphx.VertexId
+import com.wdcloud.graphx.recommend.RecEngBySubGraph
+
+/**
+ * Spark JobServer测试
+ * http://debugo.com/jobserver-project-namedrdd/
+ * 前者用于验证（如下面代码验证了input.string中需要有指定的内容），还可以验证HDFS或者其他配置信息。
+ * 后者为job的执行代码（需要传入一个SparkContext，同样需要config，config中包含*.conf的信息）
+ *
+ * NamedRddSupport: 通过继承它，可以实现对缓存的RDD的重用
+ */
+class RecBasedGraphxServer extends Serializable with SparkJob with NamedRddSupport {
+
+  override def validate(sc: SparkContext, config: Config): SparkJobValidation = {
+    Try(config.getString("namespace"))
+      .map(x => SparkJobValid)
+      .getOrElse(SparkJobInvalid("No namespace config param"))
+  }
+
+  override def runJob(sc: SparkContext, config: Config): Unit = {
+    val list = config.getStringList("userIdList").asScala.toList.asInstanceOf[List[String]]
+    RecEngBySubGraph.startRecEntry(
+      sc,
+      config.getString("namespace").toUpperCase(),
+      config.getString("edgeTable").toUpperCase(),
+      config.getString("pAttrTable").toUpperCase(),
+      config.getString("iAttrTable").toUpperCase(),
+      list
+    )
+  }  
+}
+
+
+
+
+
+
+
+
+
+

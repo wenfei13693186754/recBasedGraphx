@@ -1,0 +1,58 @@
+package com.wdcloud.graphx.graphOperate
+
+import java.io.Serializable
+
+import scala.Iterator
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.EdgeTriplet
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import org.apache.spark.graphx.TripletFields
+import org.apache.spark.graphx.VertexId
+import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+import com.google.common.hash.Hashing
+import com.wdcloud.graphx.unit.DataToJson
+import com.wdcloud.graphx.kafka.Producer
+import com.wdcloud.graphx.hbase.SparkHbase
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.HTable
+import org.apache.hadoop.hbase.client.Put
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+
+ import akka.event.slf4j.Logger
+import scala.collection.immutable.Seq
+import org.apache.hadoop.hbase.client.Get
+import org.apache.hadoop.hbase.client.Scan
+
+class CreateGraph() extends Serializable{
+
+  /**
+   * 根据入参创建图
+   * param:
+   * 		edgeTable: Hbase中存放用户物品(包括好友和物品)关系信息的表的表名
+   * 		perTable: Hbase中存放用户信息表的表名
+   * 		itrTable: Hbase中存放物品关系表的表名
+   * return：
+   * 		Graph[Map[String, Object], Double]
+   */
+  def createGraph(edgeTable: String, perTable: String, itrTable: String): Graph[Map[String, Object], Double] = {
+    val logger = Logger(this.getClass.getName)
+    val readData = new ReadData()
+    val edges = readData.readEdgesData(edgeTable)
+    logger.warn("边edges RDD创建好了")
+    val vertex = readData.readPersonAttrData(perTable).++(readData.readItemAttrData(itrTable))
+    logger.warn("顶点vertex RDD创建好了")
+    //利用 fromEdges建立图 
+    val graph = Graph(vertex, edges).cache
+    graph  
+  }
+}

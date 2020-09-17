@@ -1,0 +1,175 @@
+package com.wdcloud.graphx.recommend
+
+import java.io.Serializable
+
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
+import akka.event.slf4j.Logger
+import com.google.common.hash.Hashing
+import org.apache.spark.HashPartitioner
+import com.wdcloud.graphx.pojo.LogType
+
+object ReadData extends Serializable {
+
+  val logger = Logger(this.getClass.getName)
+
+  val conf1 = HBaseConfiguration.create()
+  conf1.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+  conf1.set("hbase.zookeeper.property.clientPort", "2181");
+  conf1.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+  conf1.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+  conf1.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+  /**
+   * 从hbase中读取边数据生成边RDD
+   *
+   * TableInputFormat包含多个可以用来优化HBase的读取的设置值，比如将扫描限制到一部分列，以及扫描的时间范围。
+   * 可以在其官方文档：http://hbase.apache.org/apidocs/org/apache/hadoop/hbase/mapreduce/TableInputFormat.html中找到详细信息，并在HBaseConfiguration中对它们进行设置
+   *
+   *
+   * newAPIHadoopRDD是用来读取其它Hadoop输入格式数据的
+   * 它的接收一个路径以及三个类，如果有需要设定额外的Hadoop配置属性，也可以传入一个conf对象
+   * 		它的三个类：
+   * 				1.第一个类是“格式”类，代表输入的格式；
+   * 				2.第二个则是键的类；
+   * 				3.第三个类是值的类。
+   * (因为我们可以通过Hadoop输入格式访问HBase,这个格式返回的键值对的数据中键和值的类型就是我们下边的类型)
+   */
+  def readEdgesData(sc: SparkContext, tableName: String): RDD[Edge[Double]] = {
+
+    conf1.set(TableInputFormat.INPUT_TABLE, tableName) //扫描那张表
+    val t3 = System.currentTimeMillis()
+
+    val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(12))
+
+    val edgesData = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+
+        val key = Bytes.toString(result.getRow)
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户关系的物品(好友、圈子、物品)业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品类别
+        val LAST_TIME = Bytes.toString(result.getValue("INFO".getBytes, "BHV_DATETIME".getBytes)) //读出时间戳
+        var BHV_TYPE = Bytes.toString(result.getValue("INFO".getBytes, "ACTION".getBytes)) //读出行为类型
+
+        //生成srcId
+        val srcId = hashId("person", USERID)
+        //生成dstId
+        val dstId = hashId(CATEGORY, ITEM_ID)
+        //读取行为类型
+        val relaScore: Double = BHV_TYPE match {
+          
+          case LogType.COLLECT => 1.0
+          case LogType.COMMENT => 0.9
+          case LogType.FOLLOW => 0.8
+          case LogType.GRADE => 0.7
+          case LogType.ITEM => 0.6
+          case LogType.JOIN => 0.5
+          case LogType.LIKE => 0.4
+          case LogType.REPLY => 0.3
+          case LogType.SHARE   => 0
+          case LogType.UNCOLLECT => 0.5
+          case LogType.UNFOLLOW => 0.4
+          case LogType.UNLIKE => 0.3
+          case LogType.VIEW   => 0
+          case _ => 0
+        }
+        //计算顶点之间亲密度
+        val totalScore: Double = math.log10(relaScore * 1000000 / math.pow(LAST_TIME.toLong / 360000000, 1.5) + 1)
+        
+        Edge(srcId, dstId, totalScore)
+
+    }
+
+    edgesData
+  }
+
+  /**
+   * 读取用户属性的信息
+   * 	表名：TESTSPACE:T_LOG_PERSON
+   * 	最终形成的数据格式：person_1|person girl 25 beijing rose 1 2
+   */
+  def readPersonAttrData(sc: SparkContext, tableName: String): RDD[(Long, Map[String, Object])] = {
+    conf1.set(TableInputFormat.INPUT_TABLE, tableName)
+    //Initialize hBase table if necessary,初始化hbase表
+    //val admin = new HBaseAdmin(conf1)
+    //if (admin.isTableAvailable(tableName)) {
+
+    val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(12))
+
+    logger.warn("用户属性RDD分区数是: " + hBaseRDD.getNumPartitions)
+
+    val pAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        //val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出用户类别类别
+        //对读出来的数据进行过滤，过滤掉不合格的数据
+        //生成srcId
+        val srcId = hashId("person", USERID)
+        //对于圈子作为一个顶点存在的话，使用如下代码
+        //将属性添加到map集合中
+        var attr: Map[String, Object] = Map("type" -> "person", "businessId" -> USERID)
+        (srcId, attr)
+    }
+    pAttrRDD
+  }
+
+  /**
+   * 读取用户属性的信息
+   * 	表名：TESTSPACE:T_LOG_ITEM
+   * 	最终形成的数据格式：person_1|person girl 25 beijing rose 1 2
+   */
+  def readItemAttrData(sc: SparkContext, tableName: String): RDD[(Long, Map[String, Object])] = {
+    conf1.set(TableInputFormat.INPUT_TABLE, tableName)
+    // Initialize hBase table if necessary,初始化hbase表
+    //val admin = new HBaseAdmin(conf1)
+    //if (admin.isTableAvailable(tableName)) {
+
+    val hBaseRDD = sc.newAPIHadoopRDD(conf1, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(12))
+
+    logger.warn("物品属性RDD分区数是: " + hBaseRDD.getNumPartitions)
+
+    val iAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出用户类别类别
+
+        //对读出来的数据进行过滤，过滤掉不合格的数据
+        //将读出来的数据按照规定格式拼接起来，成为一行，
+        val srcId = hashId(CATEGORY, ITEM_ID)
+        //对于圈子作为一个顶点存在的话，使用如下代码
+        //将属性添加到map集合中
+        var attr: Map[String, Object] = Map("type" -> CATEGORY, "businessId" -> ITEM_ID)
+        (srcId, attr)
+    }
+    iAttrRDD
+  }
+
+  /*
+   * 标识不同物品id的工具方法
+   */
+  def hashId(name: String, str: String) = {
+    Hashing.md5().hashString(name + "" + str).asLong()
+  }
+}
+
+
+
+
+
+
+

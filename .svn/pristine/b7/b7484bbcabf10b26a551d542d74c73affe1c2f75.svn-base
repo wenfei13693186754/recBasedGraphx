@@ -1,0 +1,58 @@
+package com.wdcloud.graphx.test
+
+import java.io.Serializable
+
+import org.apache.spark.graphx.EdgeDirection
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Graph.graphToGraphOps
+
+import akka.event.slf4j.Logger
+import com.wdcloud.graphx.model.graph.ReadData
+import org.apache.spark.SparkContext
+  
+object CreateGraphTest extends Serializable{  
+  /*   
+   * 创建图  
+   * Graph[Array[String], Double]   这里创建图使用了Graph类的单例对象的aply构造方法创建，返回的Graph中的Array[String]是vertices的attr的类型
+   * Double是Edge上的属性的类型  
+   */
+  //def createGraph(namespace: String): Graph[Map[String, Object], Double] = {
+  def createGraph(sc: SparkContext, edgeTable: String, perTable: String, iterTable: String): Graph[Map[String, Object], Double] = {
+    val logger = Logger(this.getClass.getName)
+    
+    //val edges = readData.readEdgesData(namespace+":T_LOG_STATISTICS")   
+    //创建边RDD
+    val userId = "RRT"
+    val namespace = "JANUARY"
+    val userIden = namespace+userId
+    val tableName = "T_USER_CONF"
+    val rec = ReadData.getUserInfo(sc, namespace, tableName, userIden)
+    val edges = ReadData.readEdgesData(sc, edgeTable, rec)
+    
+    //val vertex = readData.readPersonAttrData(namespace+":T_LOG_PERSON").++(readData.readItemAttrData(namespace+":T_LOG_ITEM"))
+    //创建顶点RDD
+    val t0 = System.currentTimeMillis()
+    val vertex = ReadData.readPersonAttrData(sc, perTable).++(ReadData.readItemAttrData(sc, iterTable))  
+    val t1 = System.currentTimeMillis()  
+    logger.warn("顶点vertex RDD创建好了,用时："+(t1-t0))
+    
+    //利用 fromEdges建立图          
+    //创建中间图，并缓存
+    val graph = Graph(vertex, edges).cache
+    //全图操作，每个顶点收集自己邻居顶点id
+    val dealGraph = graph.collectNeighborIds(EdgeDirection.Either)
+    //将收集到信息的顶点重新加入到原图上，使得图中对应顶点包含自己邻居节点的id这一属性
+    val finallyGraph = graph.joinVertices(dealGraph)((id, oldCost, extraCost) => oldCost.+("neiborId" -> extraCost)).cache()
+    
+    //将中间图释放掉
+    graph.edges.unpersist(blocking = false)  
+    graph.unpersistVertices(blocking = false)
+    
+    //将顶点和边RDD释放掉
+    edges.unpersist(blocking = false)
+    vertex.unpersist(blocking = false)
+    dealGraph.unpersist(blocking = false)
+    
+    finallyGraph
+  }
+}

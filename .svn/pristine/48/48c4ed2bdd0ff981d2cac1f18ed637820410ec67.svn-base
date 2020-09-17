@@ -1,0 +1,81 @@
+package com.wdcloud.graphx.hbase;
+
+import java.io.IOException;
+import java.util.Iterator;
+import java.util.List;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.Cell;
+import org.apache.hadoop.hbase.CellUtil;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.Admin;
+import org.apache.hadoop.hbase.client.Connection;
+import org.apache.hadoop.hbase.client.ConnectionFactory;
+import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.client.ResultScanner;
+import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.client.Table;
+public class HbaseJava {
+	private static final Log log = LogFactory.getLog(HbaseJava.class);
+	Configuration conf=null;
+	
+	public HbaseJava() {
+		conf = HBaseConfiguration.create();
+		conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+		conf.set("hbase.zookeeper.property.clientPort", "2181");
+	}
+	public static void main(String[] args) throws IOException {
+		HbaseJava hbase = new HbaseJava();
+		hbase.testScanTable("RECEDGES_TESTDATA4");
+				
+	}
+	/**
+	 * 检索数据-表扫描
+	 * @author CHENYB
+	 * @param tableName
+	 * @param familyName
+	 * @throws IOException
+	 * @since 2016年8月11日 下午8:56:41
+	 */
+	public void testScanTable(String tableName) throws IOException {
+		long begin = System.currentTimeMillis();
+		System.out.println(begin);
+		Connection connection = ConnectionFactory.createConnection(conf);   
+		Admin admin = connection.getAdmin();
+		log.info("Scan table " + tableName + " to browse all datas.");
+		TableName tName = TableName.valueOf(tableName);  
+		boolean exists = admin.tableExists(tName);
+		if (!exists) {
+			log.warn("Table '" + tName.getNameAsString() + "' is not exists.");
+		} else {
+			Table table = connection.getTable(tName);
+			Scan scan = new Scan();
+			ResultScanner scanner = table.getScanner(scan);
+			int total = 0;
+			for (Iterator<Result> it = scanner.iterator(); it.hasNext();) {
+				Result result = it.next();
+				String rowkey = new String(result.getRow());
+				List<Cell> cells = result.listCells();
+				for (Cell cell : cells) {
+					//两种方式获取rowkey
+					//String rowkey = new String(CellUtil.cloneRow(cell));
+					long timestamp = cell.getTimestamp();
+					String family = new String(CellUtil.cloneFamily(cell));
+					String qualifier = new String(CellUtil.cloneQualifier(cell));
+					String value = new String(CellUtil.cloneValue(cell), "UTF-8");
+					//System.out.println(rowkey + "\t" + timestamp + "\t" + family + "." + qualifier + "\t" + value);
+				}
+				total++;
+			}
+			log.info("total: " + total + " row(s)");
+			table.close();
+		}
+		admin.close();
+		long end = System.currentTimeMillis();
+		System.out.println(end);
+		log.info("time: " + (end - begin) / 1000 + "." + (end - begin) % 1000 + "s");
+	}
+}

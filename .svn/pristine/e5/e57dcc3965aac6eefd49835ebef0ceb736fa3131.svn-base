@@ -1,0 +1,18 @@
+package com.wdcloud.graphx.unit
+
+import org.apache.kafka.common.utils.Bytes
+import org.apache.spark.SparkConf
+import org.apache.spark.graphx.Graph
+import org.apache.spark.graphx.Edge
+import org.apache.spark.SparkContext
+
+object test {
+  def main(args: Array[String]): Unit = {
+    val conf = new SparkConf().setAppName("test").setMaster("local[*]")
+    val sc = new SparkContext(conf)
+    val vertices = sc.objectFile[(Long, Map[String, Object])]("hdfs://192.168.6.84:9000/graph/vertices2")
+    val edges = sc.objectFile[Edge[Double]]("hdfs://192.168.6.84:9000/graph/edges2")
+    val graph = Graph(vertices, edges)
+    
+  }
+}

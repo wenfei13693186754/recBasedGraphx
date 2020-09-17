@@ -1,0 +1,117 @@
+package com.wdcloud.graphx.scalaUtil
+
+import scala.reflect.ClassTag
+import org.apache.spark.graphx._
+import org.apache.spark.Logging
+import org.apache.spark.graphx.Graph.graphToGraphOps
+import akka.event.slf4j.Logger
+import org.apache.spark.storage.StorageLevel
+
+
+class PregelUtil extends Logging with Serializable{
+  
+  var iterNum = 0
+  val logger = Logger(this.getClass.getName)  
+  
+  /**
+   * Execute a Pregel-like iterative vertex-parallel abstraction.  The
+   * user-defined vertex-program `vprog` is executed in parallel on
+   * each vertex receiving any inbound messages and computing a new
+   * value for the vertex.  The `sendMsg` function is then invoked on
+   * all out-edges and is used to compute an optional message to the
+   * destination vertex. The `mergeMsg` function is a commutative
+   * associative function used to combine messages destined to the
+   * same vertex.
+   *
+   * On the first iteration all vertices receive the `initialMsg` and
+   * on subsequent iterations if a vertex does not receive a message
+   * then the vertex-program is not invoked.
+   *
+   * This function iterates until there are no remaining messages, or
+   * for `maxIterations` iterations.
+   *
+   * @tparam VD the vertex data type
+   * @tparam ED the edge data type
+   * @tparam A the Pregel message type
+   *
+   * @param graph the input graph.
+   *
+   * @param initialMsg the message each vertex will receive at the first
+   * iteration
+   *
+   * @param maxIterations the maximum number of iterations to run for
+   *
+   * @param activeDirection the direction of edges incident to a vertex that received a message in
+   * the previous round on which to run `sendMsg`. For example, if this is `EdgeDirection.Out`, only
+   * out-edges of vertices that received a message in the previous round will run. The default is
+   * `EdgeDirection.Either`, which will run `sendMsg` on edges where either side received a message
+   * in the previous round. If this is `EdgeDirection.Both`, `sendMsg` will only run on edges where
+   * *both* vertices received a message.
+   *
+   * @param vprog the user-defined vertex program which runs on each
+   * vertex and receives the inbound message and computes a new vertex
+   * value.  On the first iteration the vertex program is invoked on
+   * all vertices and is passed the default message.  On subsequent
+   * iterations the vertex program is only invoked on those vertices
+   * that receive messages.
+   *
+   * @param sendMsg a user supplied function that is applied to out
+   * edges of vertices that received messages in the current
+   * iteration
+   *
+   * @param mergeMsg a user supplied function that takes two incoming
+   * messages of type A and merges them into a single message of type
+   * A.  ''This function must be commutative and associative and
+   * ideally the size of A should not increase.''
+   *
+   * @return the resulting graph at the end of the computation
+   *
+   */
+  def apply[VD: ClassTag, ED: ClassTag, A: ClassTag]
+     (graph: Graph[VD, ED],    
+      initialMsg: A,
+      maxIterations: Int = Int.MaxValue,
+      activeDirection: EdgeDirection = EdgeDirection.Either)
+     (vprog: (VertexId, VD, A) => VD,
+      sendMsg: EdgeTriplet[VD, ED] => Iterator[(VertexId, A)],
+      mergeMsg: (A, A) => A)
+    : Graph[VD, ED] =
+  {
+    //初始化，对每个节点用vprog函数计算。
+    var g = graph.mapVertices((vid, vdata) => vprog(vid, vdata, initialMsg)).cache()
+    //第一次迭代， compute the messages 根据发送、聚合信息的函数计算下次迭代用的信息。
+    var messages = g.mapReduceTriplets(sendMsg, mergeMsg).cache()
+    //数一下还有多少节点活跃 
+    var activeMessages = messages.count()  
+    // 下面进入循环迭代  
+    var prevG: Graph[VD, ED] = null
+    while (activeMessages > 0 && iterNum < maxIterations) {
+      iterNum += 1
+      // 接受消息并更新节点信息 
+      prevG = g
+      g = g.joinVertices(messages)(vprog).cache()
+      val oldMessages = messages
+      // Send new messages, skipping edges where neither side received a message. We must cache
+      // messages so it can be materialized on the next line, allowing us to uncache the previous
+      // iteration.
+      messages = g.mapReduceTriplets(
+        sendMsg, mergeMsg, Some((oldMessages, activeDirection))).persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+      // The call to count() materializes `messages` and the vertices of `g`. This hides oldMessages
+      // (depended on by the vertices of g) and the vertices of prevG (depended on by oldMessages
+      // and the vertices of g).
+      activeMessages = messages.count() 
+
+      logger.warn("Pregel finished iteration " + iterNum)
+ 
+      //Unpersist the RDDs hidden by newly-materialized RDDs
+      oldMessages.unpersist(blocking = false)
+      prevG.unpersistVertices(blocking = false)
+      prevG.edges.unpersist(blocking = false)
+      //count the iteration
+      logger.warn("活跃节点数是： "+activeMessages+" 迭代次数是： "+iterNum+" 最大迭代次数是："+maxIterations)
+    }
+    messages.unpersist(blocking = false)
+    g
+  } // end of apply
+
+} // end of class Pregel

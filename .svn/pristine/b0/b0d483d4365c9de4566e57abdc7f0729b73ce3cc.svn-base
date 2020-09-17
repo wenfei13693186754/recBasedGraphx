@@ -1,0 +1,387 @@
+package com.wdcloud.graphx.model.graph
+
+import java.io.Serializable
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.TableInputFormat
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.spark.SparkContext
+import org.apache.spark.graphx.Edge
+import org.apache.spark.rdd.RDD
+import akka.event.slf4j.Logger
+import com.google.common.hash.Hashing
+import org.apache.spark.HashPartitioner
+import com.wdcloud.graphx.pojo.LogType
+import com.wdcloud.graphx.pojo.Rec01
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.Result
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+/**
+ * 这个object用来从hbase中读取创建图模型的边数据和顶点数据以及用户配置信息
+ */
+object ReadData extends Serializable {
+
+  val logger = Logger(this.getClass.getName)
+
+  /**
+   * 从hbase中读取边数据生成边RDD
+   *
+   * TableInputFormat包含多个可以用来优化HBase的读取的设置值，比如将扫描限制到一部分列，以及扫描的时间范围。
+   * 可以在其官方文档：http://hbase.apache.org/apidocs/org/apache/hadoop/hbase/mapreduce/TableInputFormat.html中找到详细信息，并在HBaseConfiguration中对它们进行设置
+   *
+   *
+   * newAPIHadoopRDD是用来读取其它Hadoop输入格式数据的
+   * 它的接收一个路径以及三个类，如果有需要设定额外的Hadoop配置属性，也可以传入一个conf对象
+   * 		它的三个类：
+   * 				1.第一个类是“格式”类，代表输入的格式；
+   * 				2.第二个则是键的类；
+   * 				3.第三个类是值的类。
+   * (因为我们可以通过Hadoop输入格式访问HBase,这个格式返回的键值对的数据中键和值的类型就是我们下边的类型)
+   */
+  def readEdgesData(sc: SparkContext, tableName: String, rec: Array[(String, String)]): RDD[Edge[Double]] = {
+	  val confInfo = rec.toMap
+	  val endTime = System.currentTimeMillis() + ""
+	  val startTime = (System.currentTimeMillis() + confInfo.get("RETAIN_DAYS").getOrElse("0").toInt * 24 * 60 * 60 * 1000) + ""
+    
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    conf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    conf.set(TableInputFormat.INPUT_TABLE, "JANUARY:T_USER_BEHAVIOR") //扫描那张表
+    
+    if (startTime.equals(endTime)) { //如果用户没有传RETAIN_DAYS,那么默认采集所有数据，所以这里不需要设置时间段
+      conf.set(TableInputFormat.INPUT_TABLE, tableName)
+    } else {
+      conf.set(TableInputFormat.INPUT_TABLE, tableName) //扫描那张表
+      conf.set(TableInputFormat.SCAN_TIMERANGE_START, startTime)
+      conf.set(TableInputFormat.SCAN_TIMERANGE_END, endTime)
+    }
+    
+    val t3 = System.currentTimeMillis()
+    val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+
+    val edgesData = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+
+        val key = Bytes.toString(result.getRow)
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户关系的物品(好友、圈子、物品)业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品类别
+        val LAST_TIME = Bytes.toString(result.getValue("INFO".getBytes, "BHV_DATETIME".getBytes)) //读出时间戳
+        var BHV_TYPE = Bytes.toString(result.getValue("INFO".getBytes, "ACTION".getBytes)) //读出行为类型
+
+        if (key == null || USERID == null || ITEM_ID == null || CATEGORY == null || LAST_TIME == null || BHV_TYPE == null) {
+          Edge(0L, 1L, 0.0)
+        } else {
+          //生成srcId
+          val srcId = hashId("person", USERID)
+          //生成dstId
+          val dstId = hashId(CATEGORY, ITEM_ID)
+          //读取行为类型
+          val relaScore: Double = confInfo.get(BHV_TYPE).getOrElse("0").toDouble
+          //计算顶点之间亲密度
+          val totalScore: Double = math.log10(relaScore * 1000000 / math.pow(LAST_TIME.toLong / 360000000, 1.5) + 1)
+          Edge(srcId, dstId, totalScore)
+        }
+    }
+    edgesData
+  }
+ def readEdgesData1(sc: SparkContext, tableName: String): RDD[Edge[Double]] = { 
+
+	  val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    conf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    
+    conf.set(TableInputFormat.INPUT_TABLE, tableName)//扫描那张表
+    val t3 = System.currentTimeMillis()
+    
+    val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result])
+      
+    //创建一个累加器,用来计算读取到的数据行数
+    var countNum = sc.accumulator(0)
+    
+    //创建累加器用来累加用户之间的交互次数
+    var countScore = sc.accumulator(0)  
+    
+    val edgesData = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用户关系的物品(好友、圈子、物品)业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品类别
+        val LAST_TIME = Bytes.toString(result.getValue("INFO".getBytes, "BHV_DATETIME".getBytes)) //读出时间戳
+        var BHV_TYPE = Bytes.toString(result.getValue("INFO".getBytes, "ACTION".getBytes)) //读出行为类型
+
+        //生成srcId
+        val srcId = hashId("person", USERID)
+        //生成dstId
+        val dstId = hashId(CATEGORY, ITEM_ID)
+        //读取行为类型
+        val relaScore: Double = BHV_TYPE match {
+          
+          case LogType.COLLECT => 1.0
+          case LogType.COMMENT => 0.9
+          case LogType.FOLLOW => 0.8
+          case LogType.GRADE => 0.7
+          case LogType.ITEM => 0.6
+          case LogType.JOIN => 0.5
+          case LogType.LIKE => 0.4
+          case LogType.REPLY => 0.3
+          case LogType.SHARE => 0
+          case LogType.UNCOLLECT => 0.5
+          case LogType.UNFOLLOW => 0.4
+          case LogType.UNLIKE => 0.3
+          case LogType.VIEW => 0
+          case _ => 0
+        }
+        //计算顶点之间亲密度
+        val totalScore: Double = math.log10(relaScore * 1000000 / math.pow(LAST_TIME.toLong / 360000000, 1.5) + 1)
+        Edge(srcId, dstId, totalScore)
+    }
+    
+    edgesData
+  }
+  def read(tableName: String, sc: SparkContext): Unit = {
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    logger.warn("HbaseUtilReadData表名是："+tableName)
+    conf.set(TableInputFormat.INPUT_TABLE, tableName)
+    val admin = new HBaseAdmin(conf)
+    if (admin.isTableAvailable(tableName)) {
+      val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+        classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+        classOf[org.apache.hadoop.hbase.client.Result])
+      val t1 = System.currentTimeMillis()
+      logger.warn("###########ReadData RDD complete")
+      //统计数量
+      val count = hBaseRDD.count()
+      logger.warn("##########ReadData HBase RDD Count:" + count)
+    }   
+    admin.close()
+  }
+  /**
+   * 读取用户属性的信息
+   * 	表名：TESTSPACE:T_LOG_PERSON
+   * 	最终形成的数据格式：person_1|person girl 25 beijing rose 1 2
+   */
+  def readPersonAttrData(sc: SparkContext, tableName: String): RDD[(Long, Map[String, Object])] = {
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    conf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    conf.set(TableInputFormat.INPUT_TABLE, tableName)
+
+    val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+
+    logger.warn("用户属性RDD分区数是: " + hBaseRDD.getNumPartitions)
+
+    val pAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        if (USERID == null) {
+          (0L, Map("type" -> "", "businessId" -> ""))
+        } else {
+          //生成srcId
+          val srcId = hashId("person", USERID)
+          //对于圈子作为一个顶点存在的话，使用如下代码
+          //将属性添加到map集合中
+          var attr: Map[String, Object] = Map("type" -> "person", "businessId" -> USERID)
+          (srcId, attr)
+        }
+    }
+    pAttrRDD
+  }
+
+  /**
+   * 读取用户属性的信息
+   * 	表名：TESTSPACE:T_LOG_ITEM
+   * 	最终形成的数据格式：person_1|person girl 25 beijing rose 1 2
+   */
+  def readItemAttrData(sc: SparkContext, tableName: String): RDD[(Long, Map[String, Object])] = {
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    conf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    conf.set(TableInputFormat.INPUT_TABLE, tableName)
+    conf.set(TableInputFormat.SCAN_TIMERANGE_END, tableName)
+    val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+
+    logger.warn("物品属性RDD分区数是: " + hBaseRDD.getNumPartitions)
+
+    val iAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出用物品业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品类别
+
+        if (ITEM_ID == null || CATEGORY == null) {
+          (1L, Map("type" -> "", "businessId" -> ""))
+        }
+        val srcId = hashId(CATEGORY, ITEM_ID)
+        //将属性添加到map集合中
+        var attr: Map[String, Object] = Map("type" -> CATEGORY, "businessId" -> ITEM_ID)
+        (srcId, attr)
+    }
+    iAttrRDD
+  }
+
+  def readVertexData(sc: SparkContext, tableName: String): RDD[(Long, Map[String, Object])] = {
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    conf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    conf.set(TableInputFormat.INPUT_TABLE, tableName)
+
+    val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+    println("顶点数据：" + hBaseRDD.count())
+    val pAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      case (_, result) =>
+        val key = Bytes.toString(result.getRow)
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出用户业务id
+        val ITEM_ID = Bytes.toString(result.getValue("INFO".getBytes, "ITEM_ID".getBytes)) //读出物品业务id
+        val CATEGORY = Bytes.toString(result.getValue("INFO".getBytes, "CATEGORY".getBytes)) //读出物品业务类别
+        //生成srcId
+        val srcId = hashId("person", USERID)
+        val pAttr: Map[String, Object] = Map("type" -> "person", "businessId" -> USERID)
+        //生成物品itemId
+        val itemId = hashId(CATEGORY, ITEM_ID)
+        val iAttr: Map[String, Object] = Map("type" -> CATEGORY, "businessId" -> ITEM_ID)
+        ((srcId, pAttr), (itemId, iAttr))
+    }
+    pAttrRDD.map(_._1).++(pAttrRDD.map(_._2)).distinct()
+  }
+
+  /**
+   * 读取用户配置信息，用户的配置项是写死的，直接按照规定的key读取对应的value值就可以了
+   * 	 sc: 代码运行上下文
+   *	 namespace: 配置表所在hbase的命名空间
+   *	 tableName: 配置表的表名
+   *	 rowkey: 用户对应的行健
+   * return： 
+   * 	 confInfo: Array[(String, String)]
+   *   是一个封装了指定用户配置信息的数组
+   */
+  def readConfData(sc: SparkContext, namespace: String, tableName: String, userIden: String): Rec01 = {
+	  val rowKey = userIden
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    conf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    conf.set(TableInputFormat.INPUT_TABLE, tableName)
+    conf.set(TableInputFormat.SCAN_ROW_START, rowKey)
+    conf.set(TableInputFormat.SCAN_ROW_STOP, rowKey)
+    val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+
+    val pAttrRDD = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      x =>
+        val result = x._2
+        val key = Bytes.toString(result.getRow)
+        println("开始配置啦")
+        val TIME = Bytes.toInt(result.getValue("INFO".getBytes, "retain_days".getBytes)) //读出用户业务id
+        val NAMESPACE = Bytes.toString(result.getValue("INFO".getBytes, "ACCOUNT".getBytes)) //读出物品业务id
+        val USERID = Bytes.toString(result.getValue("INFO".getBytes, "USER_ID".getBytes)) //读出物品业务类别     
+        val CREATE = Bytes.toDouble(result.getValue("INFO".getBytes, "01".getBytes)) //读出用户业务id
+        val SHARE = Bytes.toDouble(result.getValue("INFO".getBytes, "02".getBytes)) //读出物品业务id
+        val COLLECT = Bytes.toDouble(result.getValue("INFO".getBytes, "03".getBytes)) //读出物品业务类别   
+        val UNCOLLECT = Bytes.toDouble(result.getValue("INFO".getBytes, "04".getBytes)) //读出用户业务id
+        val LIKE = Bytes.toDouble(result.getValue("INFO".getBytes, "05".getBytes)) //读出物品业务id
+        val UNLIKE = Bytes.toDouble(result.getValue("INFO".getBytes, "06".getBytes)) //读出物品业务类别     
+        val COMMENT = Bytes.toDouble(result.getValue("INFO".getBytes, "07".getBytes)) //读出用户业务id
+        val REPLY = Bytes.toDouble(result.getValue("INFO".getBytes, "08".getBytes)) //读出物品业务id
+        val FOLLOW = Bytes.toDouble(result.getValue("INFO".getBytes, "09".getBytes)) //读出物品业务类别   
+        val UNFOLLOW = Bytes.toDouble(result.getValue("INFO".getBytes, "10".getBytes)) //读出用户业务id
+        val VIEW = Bytes.toDouble(result.getValue("INFO".getBytes, "11".getBytes)) //读出物品业务id
+        val JOIN = Bytes.toDouble(result.getValue("INFO".getBytes, "12".getBytes)) //读出物品业务类别     
+        val OUT = Bytes.toDouble(result.getValue("INFO".getBytes, "13".getBytes)) //读出用户业务id
+        val ADDFriend = Bytes.toDouble(result.getValue("INFO".getBytes, "14".getBytes)) //读出物品业务id
+        val DELETEFriend = Bytes.toDouble(result.getValue("INFO".getBytes, "15".getBytes)) //读出物品业务类别   
+        val RATE = Bytes.toDouble(result.getValue("INFO".getBytes, "16".getBytes)) //读出用户业务id
+
+        Rec01.apply(TIME, NAMESPACE, USERID, CREATE, SHARE, COLLECT, UNCOLLECT, LIKE, UNLIKE, COMMENT, REPLY, FOLLOW, UNFOLLOW, VIEW, JOIN, OUT, ADDFriend, DELETEFriend, RATE)
+    }
+    val rec: Rec01 = pAttrRDD.filter { x => x.isInstanceOf[Rec01] }.first().asInstanceOf[Rec01]
+    rec
+  }
+  
+  /**
+   * 读取用户算法配置信息，配置项没有写死，不同的用户的配置项可能不同，这里是读取指定用户的每个配置项
+   * 	 sc: 代码运行上下文
+   *	 namespace: 配置表所在hbase的命名空间
+   *	 tableName: 配置表的表名
+   *	 rowkey: 用户对应的行健
+   * return： 
+   * 	 confInfo: Array[(String, String)]
+   *   是一个封装了指定用户配置信息的数组
+   */
+  def getUserInfo(sc: SparkContext, namespace: String, tableName: String, rowKey: String): Array[(String, String)] = {
+	  val family = "INFO"
+    val conf = HBaseConfiguration.create()
+    conf.set("hbase.zookeeper.quorum", "namenode,datanode1,datanode2,datanode3");
+    conf.set("hbase.zookeeper.property.clientPort", "2181");
+    conf.set(TableInputFormat.SCAN_CACHEBLOCKS, "false") //指定扫描出的数据是不是进行缓存，false代表不缓存
+    conf.set(TableInputFormat.SCAN_BATCHSIZE, "10000") //指定每次扫描返回的数据量
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, "INFO") //指定扫描的列族|
+    conf.set(TableInputFormat.INPUT_TABLE, tableName)
+    conf.set(TableInputFormat.SCAN_ROW_START, rowKey)
+    conf.set(TableInputFormat.SCAN_ROW_STOP, rowKey)//这里的SCAN_ROW_START和SCAN_ROW_STOP设置的值一样，是因为我们只从hbase中读取这一个用户的配置信息，所以只对应一行数据
+    conf.set(TableInputFormat.SCAN_COLUMN_FAMILY, family)
+    
+    val hBaseRDD = sc.newAPIHadoopRDD(conf, classOf[TableInputFormat],
+      classOf[org.apache.hadoop.hbase.io.ImmutableBytesWritable],
+      classOf[org.apache.hadoop.hbase.client.Result]).partitionBy(new HashPartitioner(10))
+
+    val confInfo = hBaseRDD.map { //这里是按行键读取的，也就是下边获得的key是一个一个的行健，不是一个行健组成的数组   行健：用户业务id_物品业务id
+      x =>
+        val result = x._2
+        val row = result.rawCells()
+        row.map { cell => (Bytes.toString(cell.getQualifier), Bytes.toString(cell.getValue)) }
+
+    }.first()
+    logger.warn("读取配置信息成功")
+    confInfo
+  }
+  
+  /*
+   * 标识不同物品id的工具方法
+   */
+  def hashId(name: String, str: String) = {
+    Hashing.md5().hashString(name + "" + str).asLong()
+  }
+} 
+
+
+
+
+
+
+

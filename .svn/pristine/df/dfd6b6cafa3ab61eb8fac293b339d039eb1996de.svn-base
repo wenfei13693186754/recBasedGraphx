@@ -1,0 +1,22 @@
+package com.wdcloud.graphx.scalaUtil
+
+import java.io.PrintStream
+import java.io.FileOutputStream
+import java.io.File
+import org.apache.spark.rdd.RDD
+
+/**
+ * 对文件的操作
+ */
+object FileOperate {
+  
+  /**
+   * 将推荐结果持久化到text文件
+   */
+  def saveResultToText(recResult: RDD[(String, String, Map[String, List[(String, Double)]])]){
+    val fs = new FileOutputStream(
+		new File("/wdcloud/app/spark/data/rec_jobserver_result/recResultForAllUser.log"));
+    val p = new PrintStream(fs);
+    recResult.collect().foreach(x => p.println(s"用户 ${x._1} 的推荐结果是：${x._2}***${x._3.mkString(",")}"))
+  }
+}
